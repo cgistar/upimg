@@ -1,0 +1,38 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Node
+**/.next
+**/.pnpm-store
+node_modules/
+**/out
+
+# Rust
+**/target/
+
+# Python
+**/bin
+**/__pycache__/
+**/.venv
+!/bin/
+!/bin/*.sh
+
+# Logs
+*.log
+dist/
+
+# editor
+.vscode
+.idea/
+.kiro
+.claude
+.cursor
+.worktrees/
+.pnpm-store/
+
+# Go
+.gocache
+.gomodcache
+go.sum
+**/*_test.go

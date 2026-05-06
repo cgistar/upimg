@@ -1,0 +1,19 @@
+services:
+  upimg:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: upimg:dist
+    container_name: upimg
+    restart: unless-stopped
+    ports:
+      - "17788:17788"
+    environment:
+      DATA: /data
+      FILEPATH: /data/files
+      PORT: 17788
+      # 如需覆盖 config.json 中的 key，可取消注释：
+      # KEY: secret
+    volumes:
+      - ./data:/data
+      - /home/upimg:/data/files

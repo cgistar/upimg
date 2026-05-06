@@ -1,0 +1,19 @@
+{
+  "host": "0.0.0.0",
+  "port": 17788,
+  "key": "secret",
+  "rename": "apps/{year}/{month}/{day}/{filename}",
+  "filePath": "/var/www",
+  "url_prefix": "https://www.demo.com/upimg",
+  "s3": [
+    {
+      "bucket": "factory-recipe-docs",
+      "region": "us-east-1",
+      "access_key": "AKIAEXAMPLE",
+      "secret_key": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+      "endpoint": "https://s3.amazonaws.com",
+      "url_prefix": "https://factory-recipe-docs.s3.amazonaws.com/",
+      "selected": true
+    }
+  ]
+}
