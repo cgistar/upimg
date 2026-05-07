@@ -108,6 +108,10 @@ func (a *App) handleUpload(w http.ResponseWriter, r *http.Request) {
 	for _, result := range results {
 		urls = append(urls, result.ImgURL)
 	}
+	if isRawUpload(r) {
+		writeRawURLs(w, urls)
+		return
+	}
 	writeUpload(w, UploadResponse{Success: true, Result: urls, FullResult: results})
 }
 
@@ -281,6 +285,10 @@ func isMultipart(contentType string) bool {
 	return strings.HasPrefix(strings.ToLower(contentType), "multipart/form-data")
 }
 
+func isRawUpload(r *http.Request) bool {
+	return r.URL.Query().Get("f") == "raw"
+}
+
 func sanitizeFileName(value string) string {
 	value = filepath.Base(strings.ReplaceAll(value, "\\", "/"))
 	value = strings.TrimSpace(value)
@@ -305,6 +313,11 @@ func writeUploadStatus(w http.ResponseWriter, status int, response UploadRespons
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(response)
+}
+
+func writeRawURLs(w http.ResponseWriter, urls []string) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = io.WriteString(w, strings.Join(urls, "\n"))
 }
 
 func writeList(w http.ResponseWriter, response ListResponse) {

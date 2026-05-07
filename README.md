@@ -146,6 +146,13 @@ curl -X POST "http://127.0.0.1:17788/upload?key=secret" \
 }
 ```
 
+如果需要直接返回 URL 文本而不是 JSON，可以追加 `f=raw`：
+
+```bash
+curl -X POST "http://127.0.0.1:17788/upload?key=secret&f=raw" \
+  -F "file=@/path/to/demo.png"
+```
+
 ### 上传服务端本机文件
 
 JSON 上传读取的是服务进程所在机器上的文件路径，适合可信内网或自动化场景。

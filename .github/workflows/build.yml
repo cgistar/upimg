@@ -83,11 +83,6 @@ jobs:
             tar -C package -czf "dist/upimg-${{ matrix.target.name }}.tar.gz" "${binary}"
           fi
 
-      - name: Checksums
-        run: |
-          set -euo pipefail
-          (cd dist && sha256sum * > "upimg-${{ matrix.target.name }}.sha256")
-
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
