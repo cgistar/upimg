@@ -21,9 +21,6 @@ func NewLocal(root string) (*Local, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(abs, 0o755); err != nil {
-		return nil, err
-	}
 	return &Local{root: abs}, nil
 }
 
@@ -131,6 +128,9 @@ func (l *Local) List(ctx context.Context, baseURL string) ([]Object, error) {
 		})
 		return nil
 	})
+	if os.IsNotExist(err) {
+		return objects, nil
+	}
 	return objects, err
 }
 

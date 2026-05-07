@@ -53,7 +53,15 @@ func run() error {
 }
 
 func buildBackend(ctx context.Context, runtime config.Runtime) (storage.Backend, error) {
-	if selected, ok := config.SelectedS3(runtime.Config); ok {
+	for _, selected := range runtime.Config.S3 {
+		if !selected.Selected {
+			continue
+		}
+		if !selected.Valid() {
+			log.Printf("selected s3 config is invalid, fallback to local storage: %s missing %s", s3Label(selected), strings.Join(selected.MissingFields(), ", "))
+			continue
+		}
+
 		s3Backend, err := storage.NewS3(ctx, selected)
 		if err == nil {
 			probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -62,9 +70,9 @@ func buildBackend(ctx context.Context, runtime config.Runtime) (storage.Backend,
 			if err == nil {
 				return s3Backend, nil
 			}
-			log.Printf("selected s3 is not reachable, fallback to local storage: %v", err)
+			log.Printf("selected s3 is not reachable, fallback to local storage: %s error=%v", s3Label(selected), err)
 		} else {
-			log.Printf("selected s3 config is invalid, fallback to local storage: %v", err)
+			log.Printf("selected s3 config is invalid, fallback to local storage: %s error=%v", s3Label(selected), err)
 		}
 	}
 
@@ -76,4 +84,17 @@ func buildBackend(ctx context.Context, runtime config.Runtime) (storage.Backend,
 		log.Printf("FILEPATH and config.filePath are empty, using current directory: %s", runtime.LocalRoot)
 	}
 	return local, nil
+}
+
+func s3Label(cfg config.S3Config) string {
+	if name := strings.TrimSpace(cfg.Name); name != "" {
+		return "name=" + name
+	}
+	if bucket := strings.TrimSpace(cfg.Bucket); bucket != "" {
+		return "bucket=" + bucket
+	}
+	if endpoint := strings.TrimSpace(cfg.Endpoint); endpoint != "" {
+		return "endpoint=" + endpoint
+	}
+	return "unknown"
 }

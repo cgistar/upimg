@@ -9,28 +9,41 @@ import (
 	"time"
 )
 
-const DefaultTemplate = "{fname}{ext}"
+const DefaultTemplate = "{filename}"
 
 func ObjectKey(fileName, target, template string, now time.Time) (string, error) {
+	return ObjectKeyWithMD5(fileName, target, template, "", now)
+}
+
+func ObjectKeyWithMD5(fileName, target, template, md5 string, now time.Time) (string, error) {
 	if strings.TrimSpace(fileName) == "" {
 		return "", fmt.Errorf("file name is empty")
-	}
-	if target != "" {
-		dir, err := SafeRelative(target)
-		if err != nil {
-			return "", err
-		}
-		return path.Join(dir, fileName), nil
 	}
 	if strings.TrimSpace(template) == "" {
 		template = DefaultTemplate
 	}
-	return RenderTemplate(template, fileName, now)
+	name, err := RenderTemplateWithMD5(template, fileName, md5, now)
+	if err != nil {
+		return "", err
+	}
+	if target != "" {
+		dir, err := RenderTemplateWithMD5(target, fileName, md5, now)
+		if err != nil {
+			return "", err
+		}
+		return path.Join(dir, name), nil
+	}
+	return name, nil
 }
 
 func RenderTemplate(template, fileName string, now time.Time) (string, error) {
+	return RenderTemplateWithMD5(template, fileName, "", now)
+}
+
+func RenderTemplateWithMD5(template, fileName, md5 string, now time.Time) (string, error) {
 	stem, ext := splitNameExt(fileName)
 	hash := shortHash(fileName)
+	extName := strings.TrimPrefix(ext, ".")
 
 	rendered := strings.NewReplacer(
 		"{year}", fmt.Sprintf("%04d", now.Year()),
@@ -41,6 +54,8 @@ func RenderTemplate(template, fileName string, now time.Time) (string, error) {
 		"{filename}", fileName,
 		"{fname}", stem,
 		"{ext}", ext,
+		"{extName}", extName,
+		"{md5}", md5,
 	).Replace(template)
 
 	return SafeRelative(rendered)

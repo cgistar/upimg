@@ -2,17 +2,41 @@
   "host": "0.0.0.0",
   "port": 17788,
   "key": "secret",
-  "rename": "apps/{year}/{month}/{day}/{filename}",
-  "filePath": "/var/www",
-  "url_prefix": "https://www.demo.com/upimg",
+  "rename": "{fname_hash}{ext}",
+  "filePath": "/data/files",
+  "urlPrefix": "https://s2.tools.com/upimg",
   "s3": [
     {
-      "bucket": "factory-recipe-docs",
-      "region": "us-east-1",
-      "access_key": "AKIAEXAMPLE",
-      "secret_key": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-      "endpoint": "https://s3.amazonaws.com",
-      "url_prefix": "https://factory-recipe-docs.s3.amazonaws.com/",
+      "name": "aliyun",
+      "bucket": "tools",
+      "region": "oss-cn-hangzhou",
+      "accessKeyID": "keyid",
+      "secretAccessKey": "secretAccess",
+      "endpoint": "http://oss-cn-hangzhou.aliyuncs.com",
+      "urlPrefix": "https://tools.oss-cn-hangzhou.aliyuncs.com",
+      "uploadPath": "apps/image/{year}-{month}-{day}",
+      "selected": false
+    },
+    {
+      "name": "qiniu",
+      "bucket": "tools",
+      "region": "cn-east-1",
+      "accessKeyID": "keyid",
+      "secretAccessKey": "secretAccess",
+      "endpoint": "https://s3.cn-east-1.qiniucs.com",
+      "urlPrefix": "http://qn.tools.cc",
+      "uploadPath": "pic/obsdata/{year}-{month}-{day}",
+      "selected": false
+    },
+    {
+      "name": "r2",
+      "bucket": "tools",
+      "region": "auto",
+      "accessKeyID": "keyid",
+      "secretAccessKey": "secretAccess",
+      "endpoint": "https://xxx.r2.cloudflarestorage.com",
+      "urlPrefix": "https://tools.r2.xyz",
+      "uploadPath": "pic/{year}-{month}-{day}",
       "selected": true
     }
   ]

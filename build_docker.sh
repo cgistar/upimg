@@ -6,7 +6,7 @@ cd "$ROOT_DIR"
 
 COMPOSE_FILE="${COMPOSE_FILE:-$ROOT_DIR/docker-compose.yml}"
 CONTAINER_CLI="${CONTAINER_CLI:-}"
-DIST_ARCHIVE="${DIST_ARCHIVE:-$ROOT_DIR/upimg-linux-amd.tar.gz}"
+DIST_ARCHIVE="${DIST_ARCHIVE:-$ROOT_DIR/upimg-linux-amd64.tar.gz}"
 
 require_command() {
   local cmd="$1"

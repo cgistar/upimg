@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"upimg/internal/config"
@@ -20,8 +23,13 @@ import (
 const maxUploadSize = 1024 * 1024 * 1024
 
 type App struct {
-	runtime config.Runtime
-	backend storage.Backend
+	runtime    config.Runtime
+	backend    storage.Backend
+	local      storage.Backend
+	s3Targets  map[string]config.S3Config
+	s3Backends map[string]storage.Backend
+	s3Factory  func(context.Context, config.S3Config) (storage.Backend, error)
+	s3Mu       sync.Mutex
 }
 
 type UploadResult struct {
@@ -48,7 +56,24 @@ type uploadJSON struct {
 }
 
 func New(runtime config.Runtime, backend storage.Backend) *App {
-	return &App{runtime: runtime, backend: backend}
+	local := backend
+	if backend.Type() != "local" {
+		if localBackend, err := storage.NewLocal(runtime.LocalRoot); err == nil {
+			local = localBackend
+		} else {
+			local = nil
+		}
+	}
+	return &App{
+		runtime:    runtime,
+		backend:    backend,
+		local:      local,
+		s3Targets:  namedS3Targets(runtime.Config.S3),
+		s3Backends: map[string]storage.Backend{},
+		s3Factory: func(ctx context.Context, cfg config.S3Config) (storage.Backend, error) {
+			return storage.NewS3(ctx, cfg)
+		},
+	}
 }
 
 func (a *App) Handler() http.Handler {
@@ -63,7 +88,7 @@ func (a *App) Handler() http.Handler {
 func (a *App) UploadFiles(ctx context.Context, files []string, target string) ([]UploadResult, error) {
 	var results []UploadResult
 	for _, file := range files {
-		result, err := a.uploadPath(ctx, file, target, a.localBaseURL(""))
+		result, err := a.uploadPath(ctx, a.backend, file, target, a.localBaseURL(""))
 		if err != nil {
 			return nil, err
 		}
@@ -88,12 +113,18 @@ func (a *App) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
+	backend, err := a.uploadBackend(r)
+	if err != nil {
+		writeUpload(w, UploadResponse{Success: false, Message: err.Error()})
+		return
+	}
+	target := strings.TrimSpace(r.URL.Query().Get("path"))
+
 	var results []UploadResult
-	var err error
 	if isMultipart(r.Header.Get("Content-Type")) {
-		results, err = a.uploadMultipart(r)
+		results, err = a.uploadMultipart(r, backend, target)
 	} else {
-		results, err = a.uploadJSON(r)
+		results, err = a.uploadJSON(r, backend, target)
 	}
 	if err != nil {
 		writeUpload(w, UploadResponse{Success: false, Message: err.Error()})
@@ -175,7 +206,7 @@ func (a *App) handleList(w http.ResponseWriter, r *http.Request) {
 	writeList(w, ListResponse{Success: true, Result: objects})
 }
 
-func (a *App) uploadJSON(r *http.Request) ([]UploadResult, error) {
+func (a *App) uploadJSON(r *http.Request, backend storage.Backend, target string) ([]UploadResult, error) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		return nil, err
@@ -189,7 +220,7 @@ func (a *App) uploadJSON(r *http.Request) ([]UploadResult, error) {
 	}
 	var results []UploadResult
 	for _, file := range payload.List {
-		result, err := a.uploadPath(r.Context(), file, "", baseURL(r))
+		result, err := a.uploadPath(r.Context(), backend, file, target, baseURL(r))
 		if err != nil {
 			return nil, err
 		}
@@ -198,7 +229,7 @@ func (a *App) uploadJSON(r *http.Request) ([]UploadResult, error) {
 	return results, nil
 }
 
-func (a *App) uploadMultipart(r *http.Request) ([]UploadResult, error) {
+func (a *App) uploadMultipart(r *http.Request, backend storage.Backend, target string) ([]UploadResult, error) {
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
 		return nil, fmt.Errorf("Error processing formData")
 	}
@@ -209,7 +240,7 @@ func (a *App) uploadMultipart(r *http.Request) ([]UploadResult, error) {
 			if err != nil {
 				return nil, fmt.Errorf("Error processing formData")
 			}
-			result, err := a.uploadReader(r.Context(), sanitizeFileName(header.Filename), "", baseURL(r), file)
+			result, err := a.uploadReader(r.Context(), backend, sanitizeFileName(header.Filename), target, baseURL(r), file)
 			_ = file.Close()
 			if err != nil {
 				return nil, err
@@ -220,30 +251,131 @@ func (a *App) uploadMultipart(r *http.Request) ([]UploadResult, error) {
 	return results, nil
 }
 
-func (a *App) uploadPath(ctx context.Context, source, target, baseURL string) (UploadResult, error) {
+func (a *App) uploadPath(ctx context.Context, backend storage.Backend, source, target, baseURL string) (UploadResult, error) {
 	file, err := os.Open(source)
 	if err != nil {
 		return UploadResult{}, err
 	}
 	defer file.Close()
-	return a.uploadReader(ctx, filepath.Base(source), target, baseURL, file)
+	return a.uploadReader(ctx, backend, filepath.Base(source), target, baseURL, file)
 }
 
-func (a *App) uploadReader(ctx context.Context, fileName, target, baseURL string, reader io.Reader) (UploadResult, error) {
-	key, err := naming.ObjectKey(fileName, target, a.runtime.Config.Rename, time.Now())
+func (a *App) uploadReader(ctx context.Context, backend storage.Backend, fileName, target, baseURL string, reader io.Reader) (UploadResult, error) {
+	body, md5sum, cleanup, err := prepareUploadBody(reader)
 	if err != nil {
 		return UploadResult{}, err
 	}
-	stored, err := a.backend.Put(ctx, key, fileName, reader)
+	defer cleanup()
+
+	if target == "" {
+		target = a.uploadDir(backend)
+	}
+	key, err := naming.ObjectKeyWithMD5(fileName, target, a.renameTemplate(), md5sum, time.Now())
 	if err != nil {
 		return UploadResult{}, err
 	}
-	if a.backend.Type() == "local" {
+	stored, err := backend.Put(ctx, key, fileName, body)
+	if err != nil {
+		return UploadResult{}, err
+	}
+	if backend.Type() == "local" {
 		if localBaseURL := a.localBaseURL(baseURL); localBaseURL != "" {
-			stored.URL = a.backend.FileURL(key, localBaseURL)
+			stored.URL = backend.FileURL(key, localBaseURL)
 		}
 	}
 	return UploadResult{FileName: stored.FileName, ImgURL: stored.URL, Type: stored.Type}, nil
+}
+
+func (a *App) uploadDir(backend storage.Backend) string {
+	if s3Backend, ok := backend.(interface{ UploadPath() string }); ok {
+		if uploadPath := strings.TrimSpace(s3Backend.UploadPath()); uploadPath != "" {
+			return uploadPath
+		}
+	}
+	return ""
+}
+
+func (a *App) renameTemplate() string {
+	return a.runtime.Config.Rename
+}
+
+func (a *App) uploadBackend(r *http.Request) (storage.Backend, error) {
+	name := strings.TrimSpace(r.URL.Query().Get("name"))
+	if name == "" {
+		return a.backend, nil
+	}
+	if name == "local" {
+		if a.local == nil {
+			return nil, fmt.Errorf("local storage is not available")
+		}
+		return a.local, nil
+	}
+	cfg, ok := a.s3Targets[name]
+	if !ok {
+		return nil, fmt.Errorf("s3 config name %q not found", name)
+	}
+	if !cfg.Valid() {
+		return nil, fmt.Errorf("s3 config name %q is invalid: missing %s", name, strings.Join(cfg.MissingFields(), ", "))
+	}
+
+	a.s3Mu.Lock()
+	defer a.s3Mu.Unlock()
+	if backend, ok := a.s3Backends[name]; ok {
+		return backend, nil
+	}
+	backend, err := a.s3Factory(r.Context(), cfg)
+	if err != nil {
+		return nil, fmt.Errorf("create s3 config name %q: %w", name, err)
+	}
+	a.s3Backends[name] = backend
+	return backend, nil
+}
+
+func namedS3Targets(items []config.S3Config) map[string]config.S3Config {
+	targets := map[string]config.S3Config{}
+	for _, item := range items {
+		name := strings.TrimSpace(item.Name)
+		if name == "" {
+			continue
+		}
+		targets[name] = item
+	}
+	return targets
+}
+
+func prepareUploadBody(reader io.Reader) (io.Reader, string, func(), error) {
+	hasher := md5.New()
+	if seeker, ok := reader.(io.ReadSeeker); ok {
+		if _, err := seeker.Seek(0, io.SeekStart); err != nil {
+			return nil, "", func() {}, err
+		}
+		if _, err := io.Copy(hasher, seeker); err != nil {
+			return nil, "", func() {}, err
+		}
+		if _, err := seeker.Seek(0, io.SeekStart); err != nil {
+			return nil, "", func() {}, err
+		}
+		return seeker, hex.EncodeToString(hasher.Sum(nil)), func() {}, nil
+	}
+
+	temp, err := os.CreateTemp("", "upimg-upload-*")
+	if err != nil {
+		return nil, "", func() {}, err
+	}
+	cleanup := func() {
+		name := temp.Name()
+		_ = temp.Close()
+		_ = os.Remove(name)
+	}
+	if _, err := io.Copy(hasher, io.TeeReader(reader, temp)); err != nil {
+		cleanup()
+		return nil, "", func() {}, err
+	}
+	if _, err := temp.Seek(0, io.SeekStart); err != nil {
+		cleanup()
+		return nil, "", func() {}, err
+	}
+	return temp, hex.EncodeToString(hasher.Sum(nil)), cleanup, nil
 }
 
 func (a *App) localBaseURL(fallback string) string {

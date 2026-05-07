@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -28,7 +29,7 @@ func NewS3(ctx context.Context, cfg config.S3Config) (*S3, error) {
 	awsCfg, err := awsconfig.LoadDefaultConfig(
 		ctx,
 		awsconfig.WithRegion(cfg.Region),
-		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(cfg.AccessKey, cfg.SecretKey, "")),
+		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(cfg.AccessKeyID, cfg.SecretAccessKey, "")),
 		awsconfig.WithRequestChecksumCalculation(aws.RequestChecksumCalculationWhenRequired),
 	)
 	if err != nil {
@@ -49,6 +50,10 @@ func (s *S3) Type() string {
 	return "aws-s3"
 }
 
+func (s *S3) UploadPath() string {
+	return s.cfg.UploadPath
+}
+
 func (s *S3) Probe(ctx context.Context) error {
 	_, err := s.client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(s.cfg.Bucket)})
 	return err
@@ -59,11 +64,15 @@ func (s *S3) Put(ctx context.Context, key, fileName string, body io.Reader) (Sto
 	if err != nil {
 		return StoredObject{}, err
 	}
-	_, err = s.client.PutObject(ctx, &s3.PutObjectInput{
+	input := &s3.PutObjectInput{
 		Bucket: aws.String(s.cfg.Bucket),
 		Key:    aws.String(key),
 		Body:   body,
-	})
+	}
+	if contentType := imageContentType(fileName); contentType != "" {
+		input.ContentType = aws.String(contentType)
+	}
+	_, err = s.client.PutObject(ctx, input)
 	if err != nil {
 		return StoredObject{}, err
 	}
@@ -125,4 +134,29 @@ func (s *S3) List(ctx context.Context, _ string) ([]Object, error) {
 		}
 	}
 	return objects, nil
+}
+
+func imageContentType(fileName string) string {
+	switch strings.ToLower(filepath.Ext(fileName)) {
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".png":
+		return "image/png"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	case ".svg":
+		return "image/svg+xml"
+	case ".bmp":
+		return "image/bmp"
+	case ".ico":
+		return "image/x-icon"
+	case ".tif", ".tiff":
+		return "image/tiff"
+	case ".avif":
+		return "image/avif"
+	default:
+		return ""
+	}
 }

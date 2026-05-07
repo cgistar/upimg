@@ -21,20 +21,20 @@ type Config struct {
 	Key       string     `json:"key"`
 	Rename    string     `json:"rename"`
 	FilePath  string     `json:"filePath"`
-	URLPrefix string     `json:"url_prefix"`
+	URLPrefix string     `json:"urlPrefix"`
 	S3        []S3Config `json:"s3"`
 }
 
 type S3Config struct {
-	Bucket     string `json:"bucket"`
-	Region     string `json:"region"`
-	AccessKey  string `json:"access_key"`
-	SecretKey  string `json:"secret_key"`
-	Endpoint   string `json:"endpoint"`
-	URLPrefix  string `json:"url_prefix"`
-	Selected   bool   `json:"selected"`
-	Name       string `json:"name"`
-	ConfigName string `json:"_configName"`
+	Bucket          string `json:"bucket"`
+	Region          string `json:"region"`
+	AccessKeyID     string `json:"accessKeyID"`
+	SecretAccessKey string `json:"secretAccessKey"`
+	Endpoint        string `json:"endpoint"`
+	URLPrefix       string `json:"urlPrefix"`
+	UploadPath      string `json:"uploadPath"`
+	Selected        bool   `json:"selected"`
+	Name            string `json:"name"`
 }
 
 type Runtime struct {
@@ -157,10 +157,24 @@ func SelectedS3(cfg Config) (S3Config, bool) {
 }
 
 func (s S3Config) Valid() bool {
-	return strings.TrimSpace(s.Bucket) != "" &&
-		strings.TrimSpace(s.Region) != "" &&
-		strings.TrimSpace(s.AccessKey) != "" &&
-		strings.TrimSpace(s.SecretKey) != ""
+	return len(s.MissingFields()) == 0
+}
+
+func (s S3Config) MissingFields() []string {
+	var missing []string
+	if strings.TrimSpace(s.Bucket) == "" {
+		missing = append(missing, "bucket")
+	}
+	if strings.TrimSpace(s.Region) == "" {
+		missing = append(missing, "region")
+	}
+	if strings.TrimSpace(s.AccessKeyID) == "" {
+		missing = append(missing, "accessKeyID")
+	}
+	if strings.TrimSpace(s.SecretAccessKey) == "" {
+		missing = append(missing, "secretAccessKey")
+	}
+	return missing
 }
 
 func isFile(path string) bool {

@@ -3,7 +3,3 @@ data
 target
 .git
 *.log
-
-# 保留 dist/upimg-linux-amd.tar.gz 给 Dockerfile 使用
-dist/*
-!dist/upimg-linux-amd.tar.gz

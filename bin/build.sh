@@ -63,7 +63,7 @@ build_one() {
   local goos="${pair%% *}"
   local goarch="${pair##* }"
   local binary="${TARGET_DIR}/upimg"
-  local archive="${TARGET_DIR}/upimg-${name}.tar.gz"
+  local archive="${TARGET_DIR}/upimg-${name}64.tar.gz"
 
   mkdir -p "$TARGET_DIR"
   rm -f "$binary" "$archive"

@@ -43,7 +43,7 @@ PORT=17788 FILEPATH=/tmp/upimg-files go run ./cmd/upimg
 go run ./cmd/upimg /path/to/demo.png -t /mnt/www
 ```
 
-`-t` 只对命令行上传生效，表示上传到指定相对目录；未指定时使用 `rename` 模板生成对象路径。
+`-t` 只对命令行上传生效，表示上传到指定相对目录；未指定时 S3 使用当前配置的 `uploadPath` 作为上传目录，本地直接使用 `rename` 渲染结果。
 
 ## 配置
 
@@ -61,17 +61,18 @@ go run ./cmd/upimg /path/to/demo.png -t /mnt/www
   "host": "0.0.0.0",
   "port": 17788,
   "key": "secret",
-  "rename": "apps/{year}/{month}/{day}/{filename}",
+  "rename": "{md5}.{extName}",
   "filePath": "/var/www",
-  "url_prefix": "https://example.com/upimg",
+  "urlPrefix": "https://example.com/upimg",
   "s3": [
     {
       "bucket": "my-bucket",
       "region": "us-east-1",
-      "access_key": "ACCESS_KEY",
-      "secret_key": "SECRET_KEY",
+      "accessKeyID": "ACCESS_KEY",
+      "secretAccessKey": "SECRET_KEY",
       "endpoint": "https://s3.amazonaws.com",
-      "url_prefix": "https://cdn.example.com",
+      "urlPrefix": "https://cdn.example.com",
+      "uploadPath": "apps/{year}/{month}/{day}",
       "selected": true,
       "name": "default"
     }
@@ -86,9 +87,9 @@ go run ./cmd/upimg /path/to/demo.png -t /mnt/www
 | `host` | string | `0.0.0.0` | HTTP 监听地址 |
 | `port` | number | `17788` | HTTP 监听端口，可被环境变量 `PORT` 覆盖 |
 | `key` | string | 空 | 上传和删除鉴权密钥，可被环境变量 `KEY` 覆盖；为空时不校验 |
-| `rename` | string | `{fname}{ext}` | 对象路径模板 |
+| `rename` | string | `{fname}{ext}` | 文件名模板，会追加到上传目录下 |
 | `filePath` | string | 当前工作目录 | 本地存储根目录，可被环境变量 `FILEPATH` 覆盖 |
-| `url_prefix` | string | 空 | 本地存储返回 URL 的固定前缀；为空时根据请求 Host 生成 `/files` 地址 |
+| `urlPrefix` | string | 空 | 本地存储返回 URL 的固定前缀；为空时根据请求 Host 生成 `/files` 地址 |
 | `s3` | array | 空 | S3 配置列表 |
 
 S3 字段：
@@ -97,14 +98,15 @@ S3 字段：
 | --- | --- | --- |
 | `bucket` | 是 | S3 bucket 名称 |
 | `region` | 是 | S3 region |
-| `access_key` | 是 | Access Key |
-| `secret_key` | 是 | Secret Key |
+| `accessKeyID` | 是 | Access Key ID |
+| `secretAccessKey` | 是 | Secret Access Key |
 | `endpoint` | 否 | S3 兼容服务 endpoint；设置后使用 path-style 请求 |
-| `url_prefix` | 否 | 返回给客户端的 URL 前缀 |
+| `urlPrefix` | 否 | 返回给客户端的 URL 前缀 |
+| `uploadPath` | 否 | 当前 S3 配置的上传目录模板 |
 | `selected` | 是 | 只有 `true` 且配置完整的项会被选中 |
-| `name` | 否 | 配置名称，仅用于标识 |
+| `name` | 否 | 配置名称；上传接口可通过 `/upload?name=xxx` 指定上传到该 S3 配置 |
 
-`rename` 支持变量：
+S3 `uploadPath` 和全局 `rename` 都支持变量；S3 `uploadPath` 只表示目录，最终对象路径为 `uploadPath + "/" + rename`。本地上传默认只使用 `rename`，也可以用 `/upload?path=...` 或命令行 `-t` 指定目录：
 
 | 变量 | 说明 |
 | --- | --- |
@@ -116,6 +118,8 @@ S3 字段：
 | `{filename}` | 完整文件名，例如 `demo.png` |
 | `{fname}` | 第一个 `.` 之前的文件名，例如 `demo` |
 | `{ext}` | 从第一个 `.` 开始的完整扩展名，例如 `.png`、`.tar.gz` |
+| `{extName}` | 不带点的扩展名，例如 `png`、`tar.gz` |
+| `{md5}` | 上传文件内容的 MD5 |
 
 ## HTTP API
 
@@ -127,6 +131,20 @@ S3 字段：
 
 ```bash
 curl -X POST "http://127.0.0.1:17788/upload?key=secret" \
+  -F "file=@/path/to/demo.png"
+```
+
+如果 `config.json` 中配置了多个 S3 目标并设置了 `s3[].name`，可以通过 `name` 指定本次上传目标：
+
+```bash
+curl -X POST "http://127.0.0.1:17788/upload?key=secret&name=default" \
+  -F "file=@/path/to/demo.png"
+```
+
+`name=local` 会强制上传到本地存储；`path` 可以指定本次上传目录。当前目标是 S3 时，`path` 作为对象目录；当前目标是本地存储时，文件会写入 `filePath/path` 下：
+
+```bash
+curl -X POST "http://127.0.0.1:17788/upload?key=secret&name=local&path=path/to" \
   -F "file=@/path/to/demo.png"
 ```
 
@@ -219,21 +237,10 @@ curl -X DELETE "http://127.0.0.1:17788/delete/demo.png?key=secret"
 
 ## Docker
 
-Docker 镜像使用仓库内的 Linux amd64 发布包构建。当前 `Dockerfile` 期望构建上下文根目录存在 `upimg-linux-amd.tar.gz`：
-
-```bash
-./bin/build.sh linux-amd
-cp dist/upimg-linux-amd.tar.gz ./upimg-linux-amd.tar.gz
-docker compose up -d --build
-```
-
-也可以使用脚本：
-
+Docker 镜像使用仓库内的 Linux amd64 发布包构建。
 ```bash
 ./build_docker.sh
 ```
-
-如果使用脚本，请确认根目录已有 `upimg-linux-amd.tar.gz`，或按上面的命令从 `dist/` 复制一份。
 
 ### docker-compose.yml
 
@@ -282,13 +289,13 @@ Docker 卷挂载：
 
 本地存储：
 
-- 如果配置了 `url_prefix`，返回 `url_prefix + "/" + object_path`。
-- 如果没有配置 `url_prefix`，根据请求协议和 Host 返回 `http://host/files/object_path`。
+- 如果配置了 `urlPrefix`，返回 `urlPrefix + "/" + object_path`。
+- 如果没有配置 `urlPrefix`，根据请求协议和 Host 返回 `http://host/files/object_path`。
 - 反向代理 HTTPS 时可设置请求头 `X-Forwarded-Proto: https`，服务会用该协议生成 URL。
 
 S3 存储：
 
-- 如果 S3 配置了 `url_prefix`，返回 `url_prefix + "/" + object_path`。
+- 如果 S3 配置了 `urlPrefix`，返回 `urlPrefix + "/" + object_path`。
 - 如果配置了 `endpoint`，返回 `endpoint + "/" + bucket + "/" + object_path`。
 - 否则返回 AWS S3 默认 URL：`https://{bucket}.s3.{region}.amazonaws.com/{object_path}`。
 
