@@ -18,6 +18,15 @@ Targets:
 USAGE
 }
 
+ensure_modules() {
+  if [[ -f "${ROOT_DIR}/go.sum" ]]; then
+    return
+  fi
+
+  echo "go.sum not found, running go mod download all"
+  go mod download all
+}
+
 target_pair() {
   case "$1" in
     macos-arm) echo "darwin arm64" ;;
@@ -25,6 +34,25 @@ target_pair() {
     linux-arm) echo "linux arm64" ;;
     linux-amd) echo "linux amd64" ;;
     *) return 1 ;;
+  esac
+}
+
+current_target() {
+  local goos
+  local goarch
+
+  goos="$(go env GOOS)"
+  goarch="$(go env GOARCH)"
+
+  case "${goos}/${goarch}" in
+    darwin/arm64) echo "macos-arm" ;;
+    darwin/amd64) echo "macos-amd" ;;
+    linux/arm64) echo "linux-arm" ;;
+    linux/amd64) echo "linux-amd" ;;
+    *)
+      echo "Unsupported current environment: ${goos}/${goarch}" >&2
+      return 1
+      ;;
   esac
 }
 
@@ -39,6 +67,7 @@ build_one() {
 
   mkdir -p "$TARGET_DIR"
   rm -f "$binary" "$archive"
+  ensure_modules
   echo "Building ${name} (${goos}/${goarch})"
   CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
     go build -trimpath -ldflags="-s -w" -o "$binary" ./cmd/upimg
@@ -51,9 +80,12 @@ build_one() {
 main() {
   cd "$ROOT_DIR"
   local target="${1:-}"
-  if [[ -z "$target" || "$target" == "-h" || "$target" == "--help" ]]; then
+  if [[ "$target" == "-h" || "$target" == "--help" ]]; then
     usage
     exit 0
+  fi
+  if [[ -z "$target" ]]; then
+    target="$(current_target)"
   fi
   if [[ "$target" == "all" ]]; then
     build_one macos-arm

@@ -5,12 +5,11 @@ import (
 	"encoding/hex"
 	"fmt"
 	"path"
-	"path/filepath"
 	"strings"
 	"time"
 )
 
-const DefaultTemplate = "{fname}.{ext}"
+const DefaultTemplate = "{fname}{ext}"
 
 func ObjectKey(fileName, target, template string, now time.Time) (string, error) {
 	if strings.TrimSpace(fileName) == "" {
@@ -30,8 +29,7 @@ func ObjectKey(fileName, target, template string, now time.Time) (string, error)
 }
 
 func RenderTemplate(template, fileName string, now time.Time) (string, error) {
-	ext := strings.TrimPrefix(filepath.Ext(fileName), ".")
-	stem := strings.TrimSuffix(fileName, filepath.Ext(fileName))
+	stem, ext := splitNameExt(fileName)
 	hash := shortHash(fileName)
 
 	rendered := strings.NewReplacer(
@@ -46,6 +44,14 @@ func RenderTemplate(template, fileName string, now time.Time) (string, error) {
 	).Replace(template)
 
 	return SafeRelative(rendered)
+}
+
+func splitNameExt(fileName string) (string, string) {
+	index := strings.Index(fileName, ".")
+	if index < 0 {
+		return fileName, ""
+	}
+	return fileName[:index], fileName[index:]
 }
 
 func SafeRelative(value string) (string, error) {

@@ -4,7 +4,9 @@
 
 服务启动时会优先使用 `config.json` 中 `selected: true` 且可连通的 S3 配置；如果 S3 配置缺失、无效或探测失败，则自动回退到本地目录存储。
 
-本服务可轻量化替代PicGo app，在 obsidian 插件 Image auto upload 中配置 https://www.demo.com/upload，就可以上传图片到当前服务器了
+本服务可轻量化替代PicGo app，在 obsidian 插件 Image auto upload 中配置 https://www.demo.com/upload 就可以上传图片到当前服务器了
+
+可使用在 typora 的图片上传中，参数填写 /path/to/upimg
 
 ## 功能
 
@@ -38,18 +40,19 @@ PORT=17788 FILEPATH=/tmp/upimg-files go run ./cmd/upimg
 命令行上传本机文件：
 
 ```bash
-go run ./cmd/upimg -target avatar /path/to/demo.png
+go run ./cmd/upimg /path/to/demo.png -t /mnt/www
 ```
 
-`-target` 或 `-t` 只对命令行上传生效，表示上传到指定相对目录；未指定时使用 `rename` 模板生成对象路径。
+`-t` 只对命令行上传生效，表示上传到指定相对目录；未指定时使用 `rename` 模板生成对象路径。
 
 ## 配置
 
 程序会按以下顺序查找配置文件：
 
 1. 如果设置了 `DATA`，读取 `${DATA}/config.json`。
-2. 否则读取可执行文件同目录下的 `config.json`。
-3. 如果配置文件不存在，则使用默认值和环境变量。
+2. 读取当前工作目录下的 `config.json`。
+3. 读取可执行文件同目录下的 `config.json`。
+4. 如果配置文件不存在，则使用默认值和环境变量。
 
 示例：
 
@@ -83,7 +86,7 @@ go run ./cmd/upimg -target avatar /path/to/demo.png
 | `host` | string | `0.0.0.0` | HTTP 监听地址 |
 | `port` | number | `17788` | HTTP 监听端口，可被环境变量 `PORT` 覆盖 |
 | `key` | string | 空 | 上传和删除鉴权密钥，可被环境变量 `KEY` 覆盖；为空时不校验 |
-| `rename` | string | `{fname}.{ext}` | 对象路径模板 |
+| `rename` | string | `{fname}{ext}` | 对象路径模板 |
 | `filePath` | string | 当前工作目录 | 本地存储根目录，可被环境变量 `FILEPATH` 覆盖 |
 | `url_prefix` | string | 空 | 本地存储返回 URL 的固定前缀；为空时根据请求 Host 生成 `/files` 地址 |
 | `s3` | array | 空 | S3 配置列表 |
@@ -111,8 +114,8 @@ S3 字段：
 | `{unix_ts}` | 当前 Unix 时间戳 |
 | `{fname_hash}` | 原文件名的 16 位短哈希 |
 | `{filename}` | 完整文件名，例如 `demo.png` |
-| `{fname}` | 不含扩展名的文件名，例如 `demo` |
-| `{ext}` | 不含点号的扩展名，例如 `png` |
+| `{fname}` | 第一个 `.` 之前的文件名，例如 `demo` |
+| `{ext}` | 从第一个 `.` 开始的完整扩展名，例如 `.png`、`.tar.gz` |
 
 ## HTTP API
 

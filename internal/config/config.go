@@ -127,11 +127,20 @@ func Path() (string, error) {
 		}
 	}
 
+	wd, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("locate current directory: %w", err)
+	}
+	path := filepath.Join(wd, "config.json")
+	if isFile(path) {
+		return path, nil
+	}
+
 	exe, err := os.Executable()
 	if err != nil {
 		return "", fmt.Errorf("locate executable: %w", err)
 	}
-	path := filepath.Join(filepath.Dir(exe), "config.json")
+	path = filepath.Join(filepath.Dir(exe), "config.json")
 	if isFile(path) {
 		return path, nil
 	}
