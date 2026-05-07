@@ -34,5 +34,4 @@ dist/
 # Go
 .gocache
 .gomodcache
-go.sum
 **/*_test.go
