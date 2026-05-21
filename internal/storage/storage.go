@@ -3,7 +3,11 @@ package storage
 import (
 	"context"
 	"io"
+	"sort"
+	"strings"
 	"time"
+
+	"upimg/internal/naming"
 )
 
 type Object struct {
@@ -12,6 +16,7 @@ type Object struct {
 	Size    int64     `json:"size"`
 	ModTime time.Time `json:"modTime"`
 	Type    string    `json:"type"`
+	IsDir   bool      `json:"isDir"`
 }
 
 type StoredObject struct {
@@ -25,5 +30,22 @@ type Backend interface {
 	Put(ctx context.Context, key, fileName string, body io.Reader) (StoredObject, error)
 	Delete(ctx context.Context, key string) error
 	FileURL(key, baseURL string) string
-	List(ctx context.Context, baseURL string) ([]Object, error)
+	List(ctx context.Context, baseURL, dir string) ([]Object, error)
+}
+
+func normalizeListDir(value string) (string, error) {
+	value = strings.TrimSpace(strings.ReplaceAll(value, "\\", "/"))
+	if strings.Trim(value, "/") == "" {
+		return "", nil
+	}
+	return naming.SafeRelative(value)
+}
+
+func sortObjects(objects []Object) {
+	sort.Slice(objects, func(i, j int) bool {
+		if objects[i].IsDir != objects[j].IsDir {
+			return objects[i].IsDir
+		}
+		return objects[i].Path < objects[j].Path
+	})
 }

@@ -98,40 +98,53 @@ func (l *Local) FileURL(key, baseURL string) string {
 	return strings.TrimRight(baseURL, "/") + "/" + key
 }
 
-func (l *Local) List(ctx context.Context, baseURL string) ([]Object, error) {
+func (l *Local) List(ctx context.Context, baseURL, dir string) ([]Object, error) {
+	dir, err := normalizeListDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	target := l.root
+	if dir != "" {
+		target, err = l.safePath(dir)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	var objects []Object
-	err := filepath.WalkDir(l.root, func(path string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if entry.IsDir() {
-			return nil
-		}
-		info, err := entry.Info()
-		if err != nil {
-			return err
-		}
-		rel, err := filepath.Rel(l.root, path)
-		if err != nil {
-			return err
-		}
-		key := filepath.ToSlash(rel)
-		objects = append(objects, Object{
-			Path:    key,
-			URL:     l.FileURL(key, baseURL),
-			Size:    info.Size(),
-			ModTime: info.ModTime(),
-			Type:    l.Type(),
-		})
-		return nil
-	})
+	entries, err := os.ReadDir(target)
 	if os.IsNotExist(err) {
 		return objects, nil
 	}
-	return objects, err
+	if err != nil {
+		return nil, err
+	}
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return nil, err
+		}
+		key := filepath.ToSlash(filepath.Join(dir, entry.Name()))
+		object := Object{
+			Path:    key,
+			Size:    info.Size(),
+			ModTime: info.ModTime(),
+			Type:    l.Type(),
+		}
+		if entry.IsDir() {
+			object.Path += "/"
+			object.Size = 0
+			object.IsDir = true
+		} else {
+			object.URL = l.FileURL(key, baseURL)
+		}
+		objects = append(objects, object)
+	}
+	sortObjects(objects)
+	return objects, nil
 }
 
 func (l *Local) Open(key string) (*os.File, error) {

@@ -198,7 +198,7 @@ func (a *App) handleList(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	objects, err := a.backend.List(r.Context(), a.localBaseURL(baseURL(r)))
+	objects, err := a.backend.List(r.Context(), a.localBaseURL(baseURL(r)), r.URL.Query().Get("path"))
 	if err != nil {
 		writeList(w, ListResponse{Success: false, Message: err.Error()})
 		return

@@ -191,9 +191,31 @@ curl "http://127.0.0.1:17788/upload"
 
 ### 列出文件
 
+列出根目录下的一层文件和目录：
+
 ```bash
 curl "http://127.0.0.1:17788/list"
 ```
+
+列出指定目录下的一层文件和目录：
+
+```bash
+curl "http://127.0.0.1:17788/list?path=image"
+curl "http://127.0.0.1:17788/list?path=xxx/yyy"
+```
+
+`/list` 不会递归列出所有文件，只返回 `path` 指定目录下的一层内容；`path` 为空时表示根目录。目录项的 `path` 以 `/` 结尾，继续下钻时把该目录路径传给 `path`，例如返回 `image/` 后请求 `/list?path=image`。
+
+字段说明：
+
+| 字段 | 说明 |
+| --- | --- |
+| `path` | 文件或目录路径；目录以 `/` 结尾 |
+| `url` | 文件访问地址；目录为空字符串 |
+| `size` | 文件大小；目录为 `0` |
+| `modTime` | 文件或目录的修改时间 |
+| `type` | 存储后端类型，例如 `local` 或 `aws-s3` |
+| `isDir` | `true` 表示目录，`false` 表示文件 |
 
 响应：
 
@@ -202,11 +224,20 @@ curl "http://127.0.0.1:17788/list"
   "success": true,
   "result": [
     {
+      "path": "image/",
+      "url": "",
+      "size": 0,
+      "modTime": "2026-05-06T10:00:00Z",
+      "type": "local",
+      "isDir": true
+    },
+    {
       "path": "demo.png",
       "url": "http://127.0.0.1:17788/files/demo.png",
       "size": 12345,
       "modTime": "2026-05-06T10:00:00Z",
-      "type": "local"
+      "type": "local",
+      "isDir": false
     }
   ]
 }

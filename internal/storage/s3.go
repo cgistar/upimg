@@ -102,19 +102,46 @@ func (s *S3) FileURL(key, _ string) string {
 	return fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", s.cfg.Bucket, s.cfg.Region, key)
 }
 
-func (s *S3) List(ctx context.Context, _ string) ([]Object, error) {
+func (s *S3) List(ctx context.Context, _ string, dir string) ([]Object, error) {
+	dir, err := normalizeListDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	prefix := ""
+	if dir != "" {
+		prefix = strings.TrimRight(dir, "/") + "/"
+	}
+
 	var objects []Object
 	var token *string
 	for {
 		output, err := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 			Bucket:            aws.String(s.cfg.Bucket),
+			Delimiter:         aws.String("/"),
+			Prefix:            aws.String(prefix),
 			ContinuationToken: token,
 		})
 		if err != nil {
 			return nil, err
 		}
+		for _, item := range output.CommonPrefixes {
+			key := aws.ToString(item.Prefix)
+			if key == "" {
+				continue
+			}
+			objects = append(objects, Object{
+				Path:    key,
+				Size:    0,
+				ModTime: time.Unix(0, 0).UTC(),
+				Type:    s.Type(),
+				IsDir:   true,
+			})
+		}
 		for _, item := range output.Contents {
 			key := aws.ToString(item.Key)
+			if key == "" || key == prefix {
+				continue
+			}
 			objects = append(objects, Object{
 				Path:    key,
 				URL:     s.FileURL(key, ""),
@@ -133,6 +160,7 @@ func (s *S3) List(ctx context.Context, _ string) ([]Object, error) {
 			objects[i].ModTime = time.Unix(0, 0).UTC()
 		}
 	}
+	sortObjects(objects)
 	return objects, nil
 }
 
