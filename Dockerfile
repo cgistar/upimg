@@ -10,7 +10,7 @@ RUN echo -e https://mirrors.ustc.edu.cn/alpine/v3.22/main/ > /etc/apk/repositori
 WORKDIR /data
 
 # 使用仓库内 dist 发布包构建镜像；如文件不存在，先执行 ./bin/build.sh linux-amd
-COPY upimg-linux-amd64.tar.gz /tmp/upimg-linux-amd64.tar.gz
+COPY dist/upimg-linux-amd64.tar.gz /tmp/upimg-linux-amd64.tar.gz
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 RUN tar -xzf /tmp/upimg-linux-amd64.tar.gz -C /app && \

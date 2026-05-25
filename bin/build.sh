@@ -15,6 +15,9 @@ Targets:
   linux-arm      linux/arm64
   linux-amd      linux/amd64
   all            build all targets
+
+Environment:
+  SKIP_WEB=1      skip Vite admin UI build
 USAGE
 }
 
@@ -25,6 +28,34 @@ ensure_modules() {
 
   echo "go.sum not found, running go mod download all"
   go mod download all
+}
+
+ensure_command() {
+  local cmd="$1"
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "missing required command: $cmd" >&2
+    exit 1
+  fi
+}
+
+build_web() {
+  if [[ "${SKIP_WEB:-}" == "1" ]]; then
+    echo "Skipping web UI build because SKIP_WEB=1"
+    return
+  fi
+  if [[ ! -f "${ROOT_DIR}/web/package.json" ]]; then
+    return
+  fi
+
+  ensure_command npm
+  echo "Building admin web UI"
+  local npm_cache="${NPM_CACHE:-${ROOT_DIR}/.npm-cache}"
+  if [[ -f "${ROOT_DIR}/web/package-lock.json" ]]; then
+    npm --cache "$npm_cache" ci --prefix "${ROOT_DIR}/web"
+  else
+    npm --cache "$npm_cache" install --prefix "${ROOT_DIR}/web"
+  fi
+  npm --cache "$npm_cache" run build --prefix "${ROOT_DIR}/web"
 }
 
 target_pair() {
@@ -88,6 +119,7 @@ main() {
     target="$(current_target)"
   fi
   if [[ "$target" == "all" ]]; then
+    build_web
     build_one macos-arm
     build_one macos-amd
     build_one linux-arm
@@ -98,6 +130,7 @@ main() {
     usage >&2
     exit 2
   fi
+  build_web
   build_one "$target"
 }
 

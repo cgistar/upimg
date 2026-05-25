@@ -18,6 +18,7 @@ const (
 type Config struct {
 	Host      string     `json:"host"`
 	Port      int        `json:"port"`
+	BasePath  string     `json:"basePath"`
 	Key       string     `json:"key"`
 	Rename    string     `json:"rename"`
 	FilePath  string     `json:"filePath"`
@@ -44,6 +45,7 @@ type Runtime struct {
 	Key        string
 	Host       string
 	Port       int
+	BasePath   string
 }
 
 func LoadRuntime() (Runtime, error) {
@@ -51,6 +53,11 @@ func LoadRuntime() (Runtime, error) {
 	if err != nil {
 		return Runtime{}, err
 	}
+	return RuntimeFromConfig(cfg, cfgPath)
+}
+
+func RuntimeFromConfig(cfg Config, cfgPath string) (Runtime, error) {
+	var err error
 
 	host := strings.TrimSpace(cfg.Host)
 	if host == "" {
@@ -67,6 +74,15 @@ func LoadRuntime() (Runtime, error) {
 	}
 	if port == 0 {
 		port = DefaultPort
+	}
+
+	basePath := strings.TrimSpace(os.Getenv("BASE_PATH"))
+	if basePath == "" {
+		basePath = strings.TrimSpace(cfg.BasePath)
+	}
+	basePath, err = NormalizeBasePath(basePath)
+	if err != nil {
+		return Runtime{}, err
 	}
 
 	root := strings.TrimSpace(os.Getenv("FILEPATH"))
@@ -96,7 +112,86 @@ func LoadRuntime() (Runtime, error) {
 		Key:        key,
 		Host:       host,
 		Port:       port,
+		BasePath:   basePath,
 	}, nil
+}
+
+func NormalizeBasePath(value string) (string, error) {
+	value = strings.TrimSpace(strings.ReplaceAll(value, "\\", "/"))
+	if value == "" || value == "/" {
+		return "", nil
+	}
+	if !strings.HasPrefix(value, "/") {
+		value = "/" + value
+	}
+	value = strings.TrimRight(value, "/")
+	if strings.Contains(value, "//") || strings.Contains(value, "/../") || strings.HasSuffix(value, "/..") || strings.Contains(value, "/./") || strings.HasSuffix(value, "/.") {
+		return "", fmt.Errorf("invalid basePath: %q", value)
+	}
+	return value, nil
+}
+
+func Write(path string, cfg Config) error {
+	if strings.TrimSpace(path) == "" {
+		return fmt.Errorf("config path is empty")
+	}
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+
+	mode := os.FileMode(0o644)
+	if info, err := os.Stat(path); err == nil {
+		mode = info.Mode().Perm()
+	}
+
+	temp, err := os.CreateTemp(filepath.Dir(path), ".config.json-*.tmp")
+	if err != nil {
+		return err
+	}
+	tempName := temp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tempName)
+		}
+	}()
+
+	if err := temp.Chmod(mode); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	if _, err := temp.Write(data); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tempName, path); err != nil {
+		return err
+	}
+	cleanup = false
+	return nil
+}
+
+func WritablePath(current string) (string, error) {
+	if strings.TrimSpace(current) != "" {
+		return current, nil
+	}
+	if data := strings.TrimSpace(os.Getenv("DATA")); data != "" {
+		return filepath.Join(data, "config.json"), nil
+	}
+	wd, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("locate current directory: %w", err)
+	}
+	return filepath.Join(wd, "config.json"), nil
 }
 
 func Load() (Config, string, error) {

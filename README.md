@@ -16,6 +16,7 @@
 - 文件删除：按对象路径删除文件。
 - 本地文件访问：本地存储模式下可通过 `/files/{path}` 访问文件。
 - S3 兼容存储：支持 AWS S3 或带自定义 `endpoint` 的 S3 兼容服务。
+- Web 管理界面：通过 `/admin/` 登录后管理 local/S3 文件、上传、删除、编辑配置和测试 S3 连通性。
 
 ## 快速开始
 
@@ -24,6 +25,14 @@
 ```bash
 go run ./cmd/upimg
 ```
+
+本地联调 Web 管理界面：
+
+```bash
+./bin/run.sh --web-dev
+```
+
+该模式会启动 Vite dev server，并让 Go 服务把 `/admin/` 代理到 Vite。默认 Vite 端口为 `5173`，可用 `WEB_DEV_PORT=5174 ./bin/run.sh --web-dev` 覆盖。也可以直接访问 Vite 地址 `http://127.0.0.1:5173/admin/`，Vite 会把 `/api/*` 代理回 Go 服务；如果 Go 端口不是默认值，使用 `PORT=18081 ./bin/run.sh --web-dev` 或显式设置 `UPIMG_API_TARGET=http://127.0.0.1:18081`。
 
 指定端口和本地存储目录：
 
@@ -35,6 +44,12 @@ PORT=17788 FILEPATH=/tmp/upimg-files go run ./cmd/upimg
 
 ```bash
 ./bin/build.sh linux-amd
+```
+
+发布包内置 `/admin/` Web UI。构建脚本会先安装并构建 `web` 目录下的 Vite React 管理界面，再把构建产物嵌入 Go 二进制。若只需要调试 Go 编译，可使用：
+
+```bash
+SKIP_WEB=1 ./bin/build.sh linux-amd
 ```
 
 命令行上传本机文件：
@@ -60,6 +75,7 @@ go run ./cmd/upimg /path/to/demo.png -t /mnt/www
 {
   "host": "0.0.0.0",
   "port": 17788,
+  "basePath": "",
   "key": "secret",
   "rename": "{md5}.{extName}",
   "filePath": "/var/www",
@@ -86,6 +102,7 @@ go run ./cmd/upimg /path/to/demo.png -t /mnt/www
 | --- | --- | --- | --- |
 | `host` | string | `0.0.0.0` | HTTP 监听地址 |
 | `port` | number | `17788` | HTTP 监听端口，可被环境变量 `PORT` 覆盖 |
+| `basePath` | string | 空 | 反向代理路径前缀，例如 `/upimg`，可被环境变量 `BASE_PATH` 覆盖 |
 | `key` | string | 空 | 上传和删除鉴权密钥，可被环境变量 `KEY` 覆盖；为空时不校验 |
 | `rename` | string | `{fname}{ext}` | 文件名模板，会追加到上传目录下 |
 | `filePath` | string | 当前工作目录 | 本地存储根目录，可被环境变量 `FILEPATH` 覆盖 |
@@ -126,6 +143,71 @@ S3 `uploadPath` 和全局 `rename` 都支持变量；S3 `uploadPath` 只表示�
 默认地址为 `http://127.0.0.1:17788`。如果配置了 `key`，上传和删除接口必须带 `?key=...`。
 
 所有接口都允许跨域请求，上传请求最大体积为 1 GiB。
+
+## Web 管理界面
+
+启动服务后访问：
+
+```text
+http://127.0.0.1:17788/admin/
+```
+
+登录使用运行时有效 key：如果设置了环境变量 `KEY`，使用 `KEY`；否则使用 `config.json.key`。如果 key 为空，管理界面会进入免登录状态并显示风险提示。
+
+管理界面能力：
+
+- 浏览 `local` 和所有 `s3[]` 配置对应的文件目录。
+- 上传文件到指定 local/S3 目标和当前目录。
+- 删除指定文件；目录只支持进入浏览，不支持直接删除。
+- 编辑 `config.json` 中的 key、rename、filePath、urlPrefix、host、port 和 S3 配置。
+- 新增、删除 S3 配置，并对单条 S3 配置执行连通性测试。
+
+保存配置后，服务会原子写入 `config.json` 并热更新 key、local 路径、S3 列表和当前选中后端。`host` 和 `port` 会写入配置文件，但当前进程监听地址不会改变，需要重启服务后生效。
+
+如果 `KEY`、`PORT` 或 `FILEPATH` 环境变量存在，它们仍然优先于 `config.json`，管理界面会提示对应字段被环境变量覆盖。
+
+### 反向代理路径前缀
+
+如果 nginx 使用带路径前缀的反向代理，例如外部访问 `/upimg`，启动服务时设置：
+
+```bash
+BASE_PATH=/upimg ./bin/run.sh
+```
+
+或在 `config.json` 中设置：
+
+```json
+{
+  "basePath": "/upimg"
+}
+```
+
+nginx 示例：
+
+```nginx
+location /upimg/ {
+  proxy_set_header Host $host;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_pass http://127.0.0.1:17788;
+}
+```
+
+访问地址：
+
+```text
+https://example.com/upimg/admin/
+```
+
+如果 nginx 已经 strip 了 `/upimg` 前缀再转发到服务，可以不设置 `BASE_PATH`，但建议加上 `X-Forwarded-Prefix`，让本地文件 URL 仍带外部前缀：
+
+```nginx
+location /upimg/ {
+  proxy_set_header Host $host;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_set_header X-Forwarded-Prefix /upimg;
+  proxy_pass http://127.0.0.1:17788/;
+}
+```
 
 ### 上传客户端文件
 
@@ -300,6 +382,7 @@ Docker 环境变量：
 | `DATA` | `/data` | 配置目录，服务会读取 `${DATA}/config.json` |
 | `FILEPATH` | `/data/files` | 本地存储根目录，优先级高于 `config.json` 中的 `filePath` |
 | `PORT` | `17788` | HTTP 监听端口，优先级高于 `config.json` 中的 `port` |
+| `BASE_PATH` | 空 | 反向代理路径前缀，优先级高于 `config.json` 中的 `basePath` |
 | `KEY` | 空 | 上传和删除鉴权密钥，优先级高于 `config.json` 中的 `key` |
 
 Docker 卷挂载：

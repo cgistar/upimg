@@ -91,6 +91,21 @@ func (s *S3) Delete(ctx context.Context, key string) error {
 	return err
 }
 
+func (s *S3) OpenReader(ctx context.Context, key string) (io.ReadCloser, error) {
+	key, err := naming.SafeRelative(key)
+	if err != nil {
+		return nil, err
+	}
+	output, err := s.client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s.cfg.Bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return output.Body, nil
+}
+
 func (s *S3) FileURL(key, _ string) string {
 	key = strings.TrimLeft(strings.ReplaceAll(key, "\\", "/"), "/")
 	if prefix := strings.TrimSpace(s.cfg.URLPrefix); prefix != "" {

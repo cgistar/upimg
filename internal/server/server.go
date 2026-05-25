@@ -18,11 +18,13 @@ import (
 	"upimg/internal/config"
 	"upimg/internal/naming"
 	"upimg/internal/storage"
+	"upimg/internal/webui"
 )
 
 const maxUploadSize = 1024 * 1024 * 1024
 
 type App struct {
+	mu         sync.RWMutex
 	runtime    config.Runtime
 	backend    storage.Backend
 	local      storage.Backend
@@ -30,6 +32,13 @@ type App struct {
 	s3Backends map[string]storage.Backend
 	s3Factory  func(context.Context, config.S3Config) (storage.Backend, error)
 	s3Mu       sync.Mutex
+
+	sessionMu  sync.Mutex
+	sessions   map[string]time.Time
+	sessionTTL time.Duration
+
+	loginMu       sync.Mutex
+	loginFailures map[string]loginFailure
 }
 
 type UploadResult struct {
@@ -56,6 +65,39 @@ type uploadJSON struct {
 }
 
 func New(runtime config.Runtime, backend storage.Backend) *App {
+	app := &App{
+		s3Factory: func(ctx context.Context, cfg config.S3Config) (storage.Backend, error) {
+			return storage.NewS3(ctx, cfg)
+		},
+		sessions:      map[string]time.Time{},
+		sessionTTL:    24 * time.Hour,
+		loginFailures: map[string]loginFailure{},
+	}
+	app.setRuntime(runtime, backend)
+	return app
+}
+
+func (a *App) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/admin", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, requestBasePath(r)+"/admin/", http.StatusPermanentRedirect)
+	})
+	adminHandler := webui.Handler("/admin/")
+	if devURL := strings.TrimSpace(os.Getenv("UPIMG_WEB_DEV_URL")); devURL != "" {
+		if proxy, err := webui.DevProxy(devURL); err == nil {
+			adminHandler = proxy
+		}
+	}
+	mux.Handle("/admin/", adminHandler)
+	mux.HandleFunc("/api/admin/", a.handleAdminAPI)
+	mux.HandleFunc("/upload", a.handleUpload)
+	mux.HandleFunc("/delete/", a.handleDelete)
+	mux.HandleFunc("/files/", a.handleFiles)
+	mux.HandleFunc("/list", a.handleList)
+	return withCORS(a.withBasePath(mux))
+}
+
+func (a *App) setRuntime(runtime config.Runtime, backend storage.Backend) {
 	local := backend
 	if backend.Type() != "local" {
 		if localBackend, err := storage.NewLocal(runtime.LocalRoot); err == nil {
@@ -64,31 +106,39 @@ func New(runtime config.Runtime, backend storage.Backend) *App {
 			local = nil
 		}
 	}
-	return &App{
-		runtime:    runtime,
-		backend:    backend,
-		local:      local,
-		s3Targets:  namedS3Targets(runtime.Config.S3),
-		s3Backends: map[string]storage.Backend{},
-		s3Factory: func(ctx context.Context, cfg config.S3Config) (storage.Backend, error) {
-			return storage.NewS3(ctx, cfg)
-		},
+
+	a.mu.Lock()
+	keyChanged := a.runtime.Key != runtime.Key
+	defer a.mu.Unlock()
+	a.runtime = runtime
+	a.backend = backend
+	a.local = local
+	a.s3Targets = namedS3Targets(runtime.Config.S3)
+	a.s3Mu.Lock()
+	defer a.s3Mu.Unlock()
+	a.s3Backends = map[string]storage.Backend{}
+	if keyChanged {
+		a.clearAdminSessions()
 	}
 }
 
-func (a *App) Handler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/upload", a.handleUpload)
-	mux.HandleFunc("/delete/", a.handleDelete)
-	mux.HandleFunc("/files/", a.handleFiles)
-	mux.HandleFunc("/list", a.handleList)
-	return withCORS(mux)
+func (a *App) runtimeSnapshot() config.Runtime {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.runtime
+}
+
+func (a *App) currentBackend() storage.Backend {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.backend
 }
 
 func (a *App) UploadFiles(ctx context.Context, files []string, target string) ([]UploadResult, error) {
 	var results []UploadResult
+	backend := a.currentBackend()
 	for _, file := range files {
-		result, err := a.uploadPath(ctx, a.backend, file, target, a.localBaseURL(""))
+		result, err := a.uploadPath(ctx, backend, file, target, a.localBaseURL(""))
 		if err != nil {
 			return nil, err
 		}
@@ -177,7 +227,8 @@ func (a *App) handleFiles(w http.ResponseWriter, r *http.Request) {
 		writeUploadStatus(w, http.StatusNotFound, UploadResponse{Success: false, Message: err.Error()})
 		return
 	}
-	if local, ok := a.backend.(*storage.Local); ok {
+	backend := a.currentBackend()
+	if local, ok := backend.(*storage.Local); ok {
 		file, err := local.Open(key)
 		if err != nil {
 			writeUploadStatus(w, http.StatusNotFound, UploadResponse{Success: false, Message: "file not found"})
@@ -190,7 +241,7 @@ func (a *App) handleFiles(w http.ResponseWriter, r *http.Request) {
 		http.ServeContent(w, r, filepath.Base(key), time.Time{}, file)
 		return
 	}
-	http.Redirect(w, r, a.backend.FileURL(key, ""), http.StatusFound)
+	http.Redirect(w, r, backend.FileURL(key, ""), http.StatusFound)
 }
 
 func (a *App) handleList(w http.ResponseWriter, r *http.Request) {
@@ -198,7 +249,8 @@ func (a *App) handleList(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	objects, err := a.backend.List(r.Context(), a.localBaseURL(baseURL(r)), r.URL.Query().Get("path"))
+	backend := a.currentBackend()
+	objects, err := backend.List(r.Context(), a.localBaseURL(baseURL(r)), r.URL.Query().Get("path"))
 	if err != nil {
 		writeList(w, ListResponse{Success: false, Message: err.Error()})
 		return
@@ -296,21 +348,27 @@ func (a *App) uploadDir(backend storage.Backend) string {
 }
 
 func (a *App) renameTemplate() string {
-	return a.runtime.Config.Rename
+	runtime := a.runtimeSnapshot()
+	return runtime.Config.Rename
 }
 
 func (a *App) uploadBackend(r *http.Request) (storage.Backend, error) {
 	name := strings.TrimSpace(r.URL.Query().Get("name"))
 	if name == "" {
-		return a.backend, nil
+		return a.currentBackend(), nil
 	}
 	if name == "local" {
-		if a.local == nil {
+		a.mu.RLock()
+		local := a.local
+		a.mu.RUnlock()
+		if local == nil {
 			return nil, fmt.Errorf("local storage is not available")
 		}
-		return a.local, nil
+		return local, nil
 	}
+	a.mu.RLock()
 	cfg, ok := a.s3Targets[name]
+	a.mu.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("s3 config name %q not found", name)
 	}
@@ -320,14 +378,15 @@ func (a *App) uploadBackend(r *http.Request) (storage.Backend, error) {
 
 	a.s3Mu.Lock()
 	defer a.s3Mu.Unlock()
-	if backend, ok := a.s3Backends[name]; ok {
+	cacheKey := "name:" + name
+	if backend, ok := a.s3Backends[cacheKey]; ok {
 		return backend, nil
 	}
 	backend, err := a.s3Factory(r.Context(), cfg)
 	if err != nil {
 		return nil, fmt.Errorf("create s3 config name %q: %w", name, err)
 	}
-	a.s3Backends[name] = backend
+	a.s3Backends[cacheKey] = backend
 	return backend, nil
 }
 
@@ -379,7 +438,8 @@ func prepareUploadBody(reader io.Reader) (io.Reader, string, func(), error) {
 }
 
 func (a *App) localBaseURL(fallback string) string {
-	if prefix := strings.TrimSpace(a.runtime.Config.URLPrefix); prefix != "" {
+	runtime := a.runtimeSnapshot()
+	if prefix := strings.TrimSpace(runtime.Config.URLPrefix); prefix != "" {
 		return prefix
 	}
 	if fallback == "" {
@@ -389,10 +449,11 @@ func (a *App) localBaseURL(fallback string) string {
 }
 
 func (a *App) verifyKey(r *http.Request) bool {
-	if a.runtime.Key == "" {
+	runtime := a.runtimeSnapshot()
+	if runtime.Key == "" {
 		return true
 	}
-	return r.URL.Query().Get("key") == a.runtime.Key
+	return r.URL.Query().Get("key") == runtime.Key
 }
 
 func routePath(rawPath, prefix string) (string, error) {
@@ -410,7 +471,65 @@ func baseURL(r *http.Request) string {
 	if forwarded := r.Header.Get("X-Forwarded-Proto"); forwarded != "" {
 		scheme = strings.Split(forwarded, ",")[0]
 	}
-	return scheme + "://" + r.Host
+	prefix := strings.TrimRight(requestBasePath(r), "/")
+	return scheme + "://" + r.Host + prefix
+}
+
+func (a *App) withBasePath(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		runtime := a.runtimeSnapshot()
+		basePath := runtime.BasePath
+		forwardedBasePath := forwardedBasePath(r)
+		if basePath == "" {
+			next.ServeHTTP(w, withRequestBasePath(r, forwardedBasePath))
+			return
+		}
+		if r.URL.Path == basePath {
+			http.Redirect(w, r, basePath+"/", http.StatusPermanentRedirect)
+			return
+		}
+		if !strings.HasPrefix(r.URL.Path, basePath+"/") {
+			http.NotFound(w, r)
+			return
+		}
+
+		cloned := r.Clone(r.Context())
+		cloned.URL.Path = strings.TrimPrefix(r.URL.Path, basePath)
+		if cloned.URL.Path == "" {
+			cloned.URL.Path = "/"
+		}
+		if r.URL.RawPath != "" {
+			cloned.URL.RawPath = strings.TrimPrefix(r.URL.RawPath, basePath)
+		}
+		next.ServeHTTP(w, withRequestBasePath(cloned, basePath))
+	})
+}
+
+func forwardedBasePath(r *http.Request) string {
+	forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-Prefix"))
+	if forwarded == "" {
+		return ""
+	}
+	basePath, err := config.NormalizeBasePath(strings.Split(forwarded, ",")[0])
+	if err != nil {
+		return ""
+	}
+	return basePath
+}
+
+func withRequestBasePath(r *http.Request, basePath string) *http.Request {
+	cloned := r.Clone(r.Context())
+	cloned.Header = r.Header.Clone()
+	cloned.Header.Set("X-Upimg-Base-Path", basePath)
+	return cloned
+}
+
+func requestBasePath(r *http.Request) string {
+	basePath, err := config.NormalizeBasePath(r.Header.Get("X-Upimg-Base-Path"))
+	if err != nil {
+		return ""
+	}
+	return basePath
 }
 
 func isMultipart(contentType string) bool {
@@ -460,7 +579,7 @@ func writeList(w http.ResponseWriter, response ListResponse) {
 func withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "*")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)

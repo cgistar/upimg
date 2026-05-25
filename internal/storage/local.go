@@ -155,6 +155,13 @@ func (l *Local) Open(key string) (*os.File, error) {
 	return os.Open(target)
 }
 
+func (l *Local) OpenReader(ctx context.Context, key string) (io.ReadCloser, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return l.Open(key)
+}
+
 func (l *Local) safePath(key string) (string, error) {
 	key, err := naming.SafeRelative(key)
 	if err != nil {
