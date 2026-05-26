@@ -6,6 +6,7 @@ Thumbs.db
 **/.next
 **/.pnpm-store
 node_modules/
+.npm-cache/
 **/out
 
 # Rust
@@ -34,4 +35,7 @@ dist/
 # Go
 .gocache
 .gomodcache
-**/*_test.go
+
+# Embedded web build output
+internal/webui/dist/index.html
+internal/webui/dist/assets/

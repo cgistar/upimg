@@ -4,10 +4,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"upimg/internal/naming"
 )
 
 const (
@@ -16,14 +19,16 @@ const (
 )
 
 type Config struct {
-	Host      string     `json:"host"`
-	Port      int        `json:"port"`
-	BasePath  string     `json:"basePath"`
-	Key       string     `json:"key"`
-	Rename    string     `json:"rename"`
-	FilePath  string     `json:"filePath"`
-	URLPrefix string     `json:"urlPrefix"`
-	S3        []S3Config `json:"s3"`
+	Host          string         `json:"host"`
+	Port          int            `json:"port"`
+	BasePath      string         `json:"basePath"`
+	Key           string         `json:"key"`
+	Rename        string         `json:"rename"`
+	FilePath      string         `json:"filePath"`
+	URLPrefix     string         `json:"urlPrefix"`
+	DefaultTarget string         `json:"defaultTarget"`
+	S3            []S3Config     `json:"s3"`
+	WebDAV        []WebDAVConfig `json:"webdav"`
 }
 
 type S3Config struct {
@@ -34,8 +39,19 @@ type S3Config struct {
 	Endpoint        string `json:"endpoint"`
 	URLPrefix       string `json:"urlPrefix"`
 	UploadPath      string `json:"uploadPath"`
-	Selected        bool   `json:"selected"`
+	Selected        bool   `json:"selected,omitempty"`
 	Name            string `json:"name"`
+}
+
+type WebDAVConfig struct {
+	Name       string `json:"name"`
+	Endpoint   string `json:"endpoint"`
+	Username   string `json:"username"`
+	Password   string `json:"password"`
+	RootPath   string `json:"rootPath"`
+	URLPrefix  string `json:"urlPrefix"`
+	UploadPath string `json:"uploadPath"`
+	Selected   bool   `json:"selected,omitempty"`
 }
 
 type Runtime struct {
@@ -270,6 +286,36 @@ func (s S3Config) MissingFields() []string {
 		missing = append(missing, "secretAccessKey")
 	}
 	return missing
+}
+
+func (w WebDAVConfig) Valid() bool {
+	return len(w.MissingFields()) == 0 && len(w.InvalidFields()) == 0
+}
+
+func (w WebDAVConfig) MissingFields() []string {
+	var missing []string
+	endpoint := strings.TrimSpace(w.Endpoint)
+	if endpoint == "" {
+		missing = append(missing, "endpoint")
+	}
+	return missing
+}
+
+func (w WebDAVConfig) InvalidFields() []string {
+	var invalid []string
+	endpoint := strings.TrimSpace(w.Endpoint)
+	if endpoint != "" {
+		parsed, err := url.Parse(endpoint)
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+			invalid = append(invalid, "endpoint")
+		}
+	}
+	if rootPath := strings.TrimSpace(w.RootPath); rootPath != "" {
+		if _, err := naming.SafeRelative(strings.Trim(rootPath, "/\\")); err != nil {
+			invalid = append(invalid, "rootPath")
+		}
+	}
+	return invalid
 }
 
 func isFile(path string) bool {

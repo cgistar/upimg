@@ -80,6 +80,7 @@ type adminTarget struct {
 	Selected bool     `json:"selected"`
 	Valid    bool     `json:"valid"`
 	Missing  []string `json:"missing,omitempty"`
+	Invalid  []string `json:"invalid,omitempty"`
 }
 
 type adminGenericResponse struct {
@@ -89,6 +90,10 @@ type adminGenericResponse struct {
 
 type adminBatchDeleteRequest struct {
 	Paths []string `json:"paths"`
+}
+
+type adminCreateFolderRequest struct {
+	Path string `json:"path"`
 }
 
 type adminBatchDeleteResponse struct {
@@ -120,6 +125,11 @@ func (a *App) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a.handleAdminStorageUpload(w, r)
+	case "/api/admin/storage/folder":
+		if !a.requireAdmin(w, r) {
+			return
+		}
+		a.handleAdminStorageFolder(w, r)
 	case "/api/admin/storage/object":
 		if !a.requireAdmin(w, r) {
 			return
@@ -140,6 +150,11 @@ func (a *App) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a.handleAdminS3Test(w, r)
+	case "/api/admin/webdav/test":
+		if !a.requireAdmin(w, r) {
+			return
+		}
+		a.handleAdminWebDAVTest(w, r)
 	default:
 		writeAdminStatus(w, http.StatusNotFound, adminGenericResponse{Success: false, Message: "api not found"})
 	}
@@ -245,6 +260,7 @@ func (a *App) handleAdminConfig(w http.ResponseWriter, r *http.Request) {
 			writeAdminStatus(w, http.StatusBadRequest, adminGenericResponse{Success: false, Message: "invalid json"})
 			return
 		}
+		cfg = normalizeAdminConfigForWrite(cfg)
 		if err := validateAdminConfig(cfg); err != nil {
 			writeAdminStatus(w, http.StatusBadRequest, adminGenericResponse{Success: false, Message: err.Error()})
 			return
@@ -327,14 +343,14 @@ func (a *App) handleAdminStorageUpload(w http.ResponseWriter, r *http.Request) {
 	writeAdmin(w, UploadResponse{Success: true, Result: urls, FullResult: results})
 }
 
-func (a *App) handleAdminStorageObject(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodDelete {
+func (a *App) handleAdminStorageFolder(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
 		writeAdminStatus(w, http.StatusMethodNotAllowed, adminGenericResponse{Success: false, Message: "method not allowed"})
 		return
 	}
-	key, err := naming.SafeRelative(r.URL.Query().Get("path"))
-	if err != nil {
-		writeAdminStatus(w, http.StatusBadRequest, adminGenericResponse{Success: false, Message: err.Error()})
+	var payload adminCreateFolderRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&payload); err != nil {
+		writeAdminStatus(w, http.StatusBadRequest, adminGenericResponse{Success: false, Message: "invalid json"})
 		return
 	}
 	backend, err := a.adminBackend(r.Context(), r.URL.Query().Get("target"))
@@ -342,11 +358,34 @@ func (a *App) handleAdminStorageObject(w http.ResponseWriter, r *http.Request) {
 		writeAdminStatus(w, http.StatusBadRequest, adminGenericResponse{Success: false, Message: err.Error()})
 		return
 	}
-	if err := backend.Delete(r.Context(), key); err != nil {
-		writeAdminStatus(w, http.StatusNotFound, adminGenericResponse{Success: false, Message: "file not found"})
+	creator, ok := backend.(storage.DirectoryCreator)
+	if !ok {
+		writeAdminStatus(w, http.StatusBadRequest, adminGenericResponse{Success: false, Message: "folder creation is not supported"})
 		return
 	}
-	writeAdmin(w, adminGenericResponse{Success: true, Message: "deleted"})
+	if err := creator.CreateDir(r.Context(), payload.Path); err != nil {
+		writeAdminStatus(w, http.StatusBadRequest, adminGenericResponse{Success: false, Message: err.Error()})
+		return
+	}
+	writeAdmin(w, adminGenericResponse{Success: true, Message: "folder created"})
+}
+
+func (a *App) handleAdminStorageObject(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		writeAdminStatus(w, http.StatusMethodNotAllowed, adminGenericResponse{Success: false, Message: "method not allowed"})
+		return
+	}
+	backend, err := a.adminBackend(r.Context(), r.URL.Query().Get("target"))
+	if err != nil {
+		writeAdminStatus(w, http.StatusBadRequest, adminGenericResponse{Success: false, Message: err.Error()})
+		return
+	}
+	key, status, err := deleteStoragePath(r.Context(), backend, r.URL.Query().Get("path"))
+	if err != nil {
+		writeAdminStatus(w, status, adminGenericResponse{Success: false, Message: err.Error()})
+		return
+	}
+	writeAdmin(w, adminGenericResponse{Success: true, Message: "deleted: " + key})
 }
 
 func (a *App) handleAdminStorageObjects(w http.ResponseWriter, r *http.Request) {
@@ -371,13 +410,9 @@ func (a *App) handleAdminStorageObjects(w http.ResponseWriter, r *http.Request) 
 
 	deleted := make([]string, 0, len(payload.Paths))
 	for _, raw := range payload.Paths {
-		key, err := naming.SafeRelative(raw)
+		key, status, err := deleteStoragePath(r.Context(), backend, raw)
 		if err != nil {
-			writeAdminStatus(w, http.StatusBadRequest, adminBatchDeleteResponse{Success: false, Deleted: deleted, Message: err.Error()})
-			return
-		}
-		if err := backend.Delete(r.Context(), key); err != nil {
-			writeAdminStatus(w, http.StatusNotFound, adminBatchDeleteResponse{Success: false, Deleted: deleted, Message: "file not found: " + key})
+			writeAdminStatus(w, status, adminBatchDeleteResponse{Success: false, Deleted: deleted, Message: err.Error()})
 			return
 		}
 		deleted = append(deleted, key)
@@ -429,6 +464,31 @@ func (a *App) handleAdminStoragePreview(w http.ResponseWriter, r *http.Request) 
 	_, _ = w.Write(data)
 }
 
+func deleteStoragePath(ctx context.Context, backend storage.Backend, rawPath string) (string, int, error) {
+	key, err := naming.SafeRelative(rawPath)
+	if err != nil {
+		return "", http.StatusBadRequest, err
+	}
+	if isDirectoryDeletePath(rawPath) {
+		deleter, ok := backend.(storage.DirectoryDeleter)
+		if !ok {
+			return "", http.StatusBadRequest, fmt.Errorf("directory deletion is not supported")
+		}
+		if err := deleter.DeleteDir(ctx, key); err != nil {
+			return key + "/", http.StatusNotFound, fmt.Errorf("directory not found: %s", key)
+		}
+		return key + "/", http.StatusOK, nil
+	}
+	if err := backend.Delete(ctx, key); err != nil {
+		return key, http.StatusNotFound, fmt.Errorf("file not found: %s", key)
+	}
+	return key, http.StatusOK, nil
+}
+
+func isDirectoryDeletePath(value string) bool {
+	return strings.HasSuffix(strings.TrimSpace(strings.ReplaceAll(value, "\\", "/")), "/")
+}
+
 func (a *App) handleAdminS3Test(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeAdminStatus(w, http.StatusMethodNotAllowed, adminGenericResponse{Success: false, Message: "method not allowed"})
@@ -458,6 +518,37 @@ func (a *App) handleAdminS3Test(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeAdmin(w, adminGenericResponse{Success: true, Message: "s3 reachable"})
+}
+
+func (a *App) handleAdminWebDAVTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeAdminStatus(w, http.StatusMethodNotAllowed, adminGenericResponse{Success: false, Message: "method not allowed"})
+		return
+	}
+	var cfg config.WebDAVConfig
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&cfg); err != nil {
+		writeAdminStatus(w, http.StatusBadRequest, adminGenericResponse{Success: false, Message: "invalid json"})
+		return
+	}
+	if !cfg.Valid() {
+		writeAdminStatus(w, http.StatusBadRequest, adminGenericResponse{Success: false, Message: webdavConfigError(cfg)})
+		return
+	}
+	backend, err := a.webdavFactory(cfg)
+	if err != nil {
+		writeAdminStatus(w, http.StatusBadRequest, adminGenericResponse{Success: false, Message: err.Error()})
+		return
+	}
+	if probe, ok := backend.(interface{ Probe(context.Context) error }); ok {
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		err = probe.Probe(ctx)
+		cancel()
+		if err != nil {
+			writeAdminStatus(w, http.StatusBadRequest, adminGenericResponse{Success: false, Message: err.Error()})
+			return
+		}
+	}
+	writeAdmin(w, adminGenericResponse{Success: true, Message: "webdav reachable"})
 }
 
 func (a *App) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
@@ -498,6 +589,10 @@ func (a *App) clearAdminSessions() {
 }
 
 func (a *App) adminBackend(ctx context.Context, target string) (storage.Backend, error) {
+	return a.backendByTarget(ctx, target)
+}
+
+func (a *App) backendByTarget(ctx context.Context, target string) (storage.Backend, error) {
 	target = strings.TrimSpace(target)
 	if target == "" {
 		return nil, fmt.Errorf("target is required")
@@ -511,56 +606,116 @@ func (a *App) adminBackend(ctx context.Context, target string) (storage.Backend,
 		}
 		return local, nil
 	}
-	if !strings.HasPrefix(target, "s3:") {
-		return nil, fmt.Errorf("unknown target %q", target)
-	}
-	index, err := strconv.Atoi(strings.TrimPrefix(target, "s3:"))
-	if err != nil || index < 0 {
-		return nil, fmt.Errorf("invalid s3 target")
-	}
 	runtime := a.runtimeSnapshot()
-	if index >= len(runtime.Config.S3) {
-		return nil, fmt.Errorf("s3 target not found")
-	}
-	cfg := runtime.Config.S3[index]
-	if !cfg.Valid() {
-		return nil, fmt.Errorf("s3 target is invalid: missing %s", strings.Join(cfg.MissingFields(), ", "))
-	}
 
-	cacheKey := fmt.Sprintf("s3:%d", index)
-	a.s3Mu.Lock()
-	defer a.s3Mu.Unlock()
-	if backend, ok := a.s3Backends[cacheKey]; ok {
+	a.cacheMu.Lock()
+	defer a.cacheMu.Unlock()
+	if backend, ok := a.backendCache[target]; ok {
 		return backend, nil
 	}
-	backend, err := a.s3Factory(ctx, cfg)
+	backend, err := a.backendForTargetConfig(ctx, runtime, target)
 	if err != nil {
-		return nil, fmt.Errorf("create s3 target: %w", err)
+		return nil, err
 	}
-	a.s3Backends[cacheKey] = backend
+	a.backendCache[target] = backend
 	return backend, nil
 }
 
 func (a *App) buildRuntimeBackend(ctx context.Context, runtime config.Runtime) (storage.Backend, error) {
-	for _, selected := range runtime.Config.S3 {
+	if target := strings.TrimSpace(runtime.Config.DefaultTarget); target != "" {
+		backend, err := a.backendForTargetConfig(ctx, runtime, target)
+		if err != nil {
+			return nil, err
+		}
+		if err := probeBackend(ctx, backend); err != nil {
+			return nil, err
+		}
+		return backend, nil
+	}
+
+	for i, selected := range runtime.Config.S3 {
 		if !selected.Selected || !selected.Valid() {
 			continue
 		}
-		backend, err := a.s3Factory(ctx, selected)
+		backend, err := a.backendForTargetConfig(ctx, runtime, fmt.Sprintf("s3:%d", i))
 		if err != nil {
 			continue
 		}
-		if probe, ok := backend.(interface{ Probe(context.Context) error }); ok {
-			probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			err = probe.Probe(probeCtx)
-			cancel()
-			if err != nil {
-				continue
-			}
+		if err := probeBackend(ctx, backend); err != nil {
+			continue
+		}
+		return backend, nil
+	}
+	for i, selected := range runtime.Config.WebDAV {
+		if !selected.Selected || !selected.Valid() {
+			continue
+		}
+		backend, err := a.backendForTargetConfig(ctx, runtime, fmt.Sprintf("webdav:%d", i))
+		if err != nil {
+			continue
+		}
+		if err := probeBackend(ctx, backend); err != nil {
+			continue
 		}
 		return backend, nil
 	}
 	return storage.NewLocal(runtime.LocalRoot)
+}
+
+func (a *App) backendForTargetConfig(ctx context.Context, runtime config.Runtime, target string) (storage.Backend, error) {
+	target = strings.TrimSpace(target)
+	if target == "local" {
+		return storage.NewLocal(runtime.LocalRoot)
+	}
+	if strings.HasPrefix(target, "s3:") {
+		index, err := strconv.Atoi(strings.TrimPrefix(target, "s3:"))
+		if err != nil || index < 0 {
+			return nil, fmt.Errorf("invalid s3 target")
+		}
+		if index >= len(runtime.Config.S3) {
+			return nil, fmt.Errorf("s3 target not found")
+		}
+		cfg := runtime.Config.S3[index]
+		if !cfg.Valid() {
+			return nil, fmt.Errorf("s3 target is invalid: missing %s", strings.Join(cfg.MissingFields(), ", "))
+		}
+		backend, err := a.s3Factory(ctx, cfg)
+		if err != nil {
+			return nil, fmt.Errorf("create s3 target: %w", err)
+		}
+		return backend, nil
+	}
+	if strings.HasPrefix(target, "webdav:") {
+		index, err := strconv.Atoi(strings.TrimPrefix(target, "webdav:"))
+		if err != nil || index < 0 {
+			return nil, fmt.Errorf("invalid webdav target")
+		}
+		if index >= len(runtime.Config.WebDAV) {
+			return nil, fmt.Errorf("webdav target not found")
+		}
+		cfg := runtime.Config.WebDAV[index]
+		if !cfg.Valid() {
+			return nil, fmt.Errorf("webdav target is invalid: %s", webdavConfigError(cfg))
+		}
+		backend, err := a.webdavFactory(cfg)
+		if err != nil {
+			return nil, fmt.Errorf("create webdav target: %w", err)
+		}
+		return backend, nil
+	}
+	return nil, fmt.Errorf("unknown target %q", target)
+}
+
+func probeBackend(ctx context.Context, backend storage.Backend) error {
+	if probe, ok := backend.(interface{ Probe(context.Context) error }); ok {
+		probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		err := probe.Probe(probeCtx)
+		cancel()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (a *App) adminRuntimeInfo(runtime config.Runtime) adminRuntimeInfo {
@@ -593,11 +748,12 @@ func (a *App) adminRuntimeInfo(runtime config.Runtime) adminRuntimeInfo {
 }
 
 func (a *App) adminTargets(runtime config.Runtime) []adminTarget {
+	defaultTarget := effectiveDefaultTarget(runtime.Config)
 	targets := []adminTarget{{
 		ID:       "local",
 		Type:     "local",
 		Name:     "Local",
-		Selected: false,
+		Selected: defaultTarget == "local",
 		Valid:    true,
 	}}
 	for i, item := range runtime.Config.S3 {
@@ -612,9 +768,27 @@ func (a *App) adminTargets(runtime config.Runtime) []adminTarget {
 			ID:       fmt.Sprintf("s3:%d", i),
 			Type:     "aws-s3",
 			Name:     name,
-			Selected: item.Selected,
+			Selected: defaultTarget == fmt.Sprintf("s3:%d", i),
 			Valid:    item.Valid(),
 			Missing:  item.MissingFields(),
+		})
+	}
+	for i, item := range runtime.Config.WebDAV {
+		name := strings.TrimSpace(item.Name)
+		if name == "" {
+			name = strings.TrimSpace(item.Endpoint)
+		}
+		if name == "" {
+			name = fmt.Sprintf("WebDAV %d", i+1)
+		}
+		targets = append(targets, adminTarget{
+			ID:       fmt.Sprintf("webdav:%d", i),
+			Type:     "webdav",
+			Name:     name,
+			Selected: defaultTarget == fmt.Sprintf("webdav:%d", i),
+			Valid:    item.Valid(),
+			Missing:  item.MissingFields(),
+			Invalid:  item.InvalidFields(),
 		})
 	}
 	return targets
@@ -624,6 +798,9 @@ func validateAdminConfig(cfg config.Config) error {
 	if cfg.Port < 0 || cfg.Port > 65535 {
 		return fmt.Errorf("port must be 0 or between 1 and 65535")
 	}
+	if err := validateDefaultTarget(cfg); err != nil {
+		return err
+	}
 	for i, item := range cfg.S3 {
 		if !s3ConfigPresent(item) {
 			continue
@@ -632,7 +809,67 @@ func validateAdminConfig(cfg config.Config) error {
 			return fmt.Errorf("s3[%d] missing %s", i, strings.Join(item.MissingFields(), ", "))
 		}
 	}
+	for i, item := range cfg.WebDAV {
+		if !webdavConfigPresent(item) {
+			continue
+		}
+		if !item.Valid() {
+			return fmt.Errorf("webdav[%d] %s", i, webdavConfigError(item))
+		}
+	}
 	return nil
+}
+
+func normalizeAdminConfigForWrite(cfg config.Config) config.Config {
+	if strings.TrimSpace(cfg.DefaultTarget) == "" {
+		cfg.DefaultTarget = effectiveDefaultTarget(cfg)
+	}
+	for i := range cfg.S3 {
+		cfg.S3[i].Selected = false
+	}
+	for i := range cfg.WebDAV {
+		cfg.WebDAV[i].Selected = false
+	}
+	return cfg
+}
+
+func validateDefaultTarget(cfg config.Config) error {
+	target := strings.TrimSpace(cfg.DefaultTarget)
+	if target == "" || target == "local" {
+		return nil
+	}
+	if strings.HasPrefix(target, "s3:") {
+		index, err := strconv.Atoi(strings.TrimPrefix(target, "s3:"))
+		if err != nil || index < 0 || index >= len(cfg.S3) {
+			return fmt.Errorf("defaultTarget points to missing s3 target")
+		}
+		return nil
+	}
+	if strings.HasPrefix(target, "webdav:") {
+		index, err := strconv.Atoi(strings.TrimPrefix(target, "webdav:"))
+		if err != nil || index < 0 || index >= len(cfg.WebDAV) {
+			return fmt.Errorf("defaultTarget points to missing webdav target")
+		}
+		return nil
+	}
+	return fmt.Errorf("defaultTarget must be local, s3:<index>, or webdav:<index>")
+}
+
+func effectiveDefaultTarget(cfg config.Config) string {
+	if target := strings.TrimSpace(cfg.DefaultTarget); target != "" {
+		return target
+	}
+	for i, item := range cfg.S3 {
+		if item.Selected && item.Valid() {
+			return fmt.Sprintf("s3:%d", i)
+		}
+	}
+	for i, item := range cfg.WebDAV {
+		if item.Selected && item.Valid() {
+			return fmt.Sprintf("webdav:%d", i)
+		}
+	}
+	return "local"
 }
 
 func s3ConfigPresent(cfg config.S3Config) bool {
@@ -645,6 +882,28 @@ func s3ConfigPresent(cfg config.S3Config) bool {
 		strings.TrimSpace(cfg.Endpoint) != "" ||
 		strings.TrimSpace(cfg.URLPrefix) != "" ||
 		strings.TrimSpace(cfg.UploadPath) != ""
+}
+
+func webdavConfigPresent(cfg config.WebDAVConfig) bool {
+	return cfg.Selected ||
+		strings.TrimSpace(cfg.Name) != "" ||
+		strings.TrimSpace(cfg.Endpoint) != "" ||
+		strings.TrimSpace(cfg.Username) != "" ||
+		strings.TrimSpace(cfg.Password) != "" ||
+		strings.TrimSpace(cfg.RootPath) != "" ||
+		strings.TrimSpace(cfg.URLPrefix) != "" ||
+		strings.TrimSpace(cfg.UploadPath) != ""
+}
+
+func webdavConfigError(cfg config.WebDAVConfig) string {
+	var parts []string
+	if missing := cfg.MissingFields(); len(missing) > 0 {
+		parts = append(parts, "missing "+strings.Join(missing, ", "))
+	}
+	if invalid := cfg.InvalidFields(); len(invalid) > 0 {
+		parts = append(parts, "invalid "+strings.Join(invalid, ", "))
+	}
+	return strings.Join(parts, "; ")
 }
 
 func (a *App) loginRetryAfter(client string) time.Duration {

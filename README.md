@@ -1,8 +1,8 @@
 # upimg
 
-`upimg` 是一个轻量级图片/文件上传服务，支持 HTTP API、命令行上传、本地文件系统存储和 S3 兼容对象存储。
+`upimg` 是一个轻量级图片/文件上传服务，支持 HTTP API、命令行上传、本地文件系统存储、S3 兼容对象存储和 WebDAV 存储。
 
-服务启动时会优先使用 `config.json` 中 `selected: true` 且可连通的 S3 配置；如果 S3 配置缺失、无效或探测失败，则自动回退到本地目录存储。
+服务启动时会优先使用 `defaultTarget` 指定的默认存储；如果未配置 `defaultTarget`，则兼容旧配置，按 `s3[]` 后 `webdav[]` 中 `selected: true` 且可连通的配置选择默认存储，最后回退到本地目录存储。
 
 本服务可轻量化替代PicGo app，在 obsidian 插件 Image auto upload 中配置 https://www.demo.com/upload 就可以上传图片到当前服务器了
 
@@ -16,7 +16,8 @@
 - 文件删除：按对象路径删除文件。
 - 本地文件访问：本地存储模式下可通过 `/files/{path}` 访问文件。
 - S3 兼容存储：支持 AWS S3 或带自定义 `endpoint` 的 S3 兼容服务。
-- Web 管理界面：通过 `/admin/` 登录后管理 local/S3 文件、上传、删除、编辑配置和测试 S3 连通性。
+- WebDAV 存储：支持 Basic Auth 或无认证的 WebDAV 远程上传、列表、删除和预览。
+- Web 管理界面：通过 `/admin/` 登录后管理 local/S3/WebDAV 文件、上传、删除、编辑配置和测试远程连通性。
 
 ## 快速开始
 
@@ -80,6 +81,7 @@ go run ./cmd/upimg /path/to/demo.png -t /mnt/www
   "rename": "{md5}.{extName}",
   "filePath": "/var/www",
   "urlPrefix": "https://example.com/upimg",
+  "defaultTarget": "webdav:0",
   "s3": [
     {
       "bucket": "my-bucket",
@@ -89,8 +91,18 @@ go run ./cmd/upimg /path/to/demo.png -t /mnt/www
       "endpoint": "https://s3.amazonaws.com",
       "urlPrefix": "https://cdn.example.com",
       "uploadPath": "apps/{year}/{month}/{day}",
-      "selected": true,
       "name": "default"
+    }
+  ],
+  "webdav": [
+    {
+      "name": "nas",
+      "endpoint": "https://dav.example.com/remote.php/dav/files/user",
+      "username": "user",
+      "password": "PASS",
+      "rootPath": "upimg",
+      "urlPrefix": "https://cdn.example.com/upimg",
+      "uploadPath": "apps/{year}/{month}/{day}"
     }
   ]
 }
@@ -107,7 +119,9 @@ go run ./cmd/upimg /path/to/demo.png -t /mnt/www
 | `rename` | string | `{fname}{ext}` | 文件名模板，会追加到上传目录下 |
 | `filePath` | string | 当前工作目录 | 本地存储根目录，可被环境变量 `FILEPATH` 覆盖 |
 | `urlPrefix` | string | 空 | 本地存储返回 URL 的固定前缀；为空时根据请求 Host 生成 `/files` 地址 |
+| `defaultTarget` | string | 空 | 默认上传后端，支持 `local`、`s3:<index>`、`webdav:<index>`；显式配置后目标不可用会报错 |
 | `s3` | array | 空 | S3 配置列表 |
+| `webdav` | array | 空 | WebDAV 配置列表 |
 
 S3 字段：
 
@@ -120,10 +134,21 @@ S3 字段：
 | `endpoint` | 否 | S3 兼容服务 endpoint；设置后使用 path-style 请求 |
 | `urlPrefix` | 否 | 返回给客户端的 URL 前缀 |
 | `uploadPath` | 否 | 当前 S3 配置的上传目录模板 |
-| `selected` | 是 | 只有 `true` 且配置完整的项会被选中 |
 | `name` | 否 | 配置名称；上传接口可通过 `/upload?name=xxx` 指定上传到该 S3 配置 |
 
-S3 `uploadPath` 和全局 `rename` 都支持变量；S3 `uploadPath` 只表示目录，最终对象路径为 `uploadPath + "/" + rename`。本地上传默认只使用 `rename`，也可以用 `/upload?path=...` 或命令行 `-t` 指定目录：
+WebDAV 字段：
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `endpoint` | 是 | WebDAV collection 地址，必须是 `http` 或 `https` |
+| `username` | 否 | Basic Auth 用户名；为空时不加认证头 |
+| `password` | 否 | Basic Auth 密码；为空时不加认证头 |
+| `rootPath` | 否 | WebDAV 远程根目录 |
+| `urlPrefix` | 否 | 返回给客户端的 URL 前缀；为空时返回 endpoint/rootPath/object_path |
+| `uploadPath` | 否 | 当前 WebDAV 配置的上传目录模板 |
+| `name` | 否 | 配置名称；上传接口可通过 `/upload?name=xxx` 指定上传到该 WebDAV 配置 |
+
+S3/WebDAV `uploadPath` 和全局 `rename` 都支持变量；`uploadPath` 只表示目录，最终对象路径为 `uploadPath + "/" + rename`。本地上传默认只使用 `rename`，也可以用 `/upload?path=...` 或命令行 `-t` 指定目录：
 
 | 变量 | 说明 |
 | --- | --- |
@@ -156,13 +181,13 @@ http://127.0.0.1:17788/admin/
 
 管理界面能力：
 
-- 浏览 `local` 和所有 `s3[]` 配置对应的文件目录。
-- 上传文件到指定 local/S3 目标和当前目录。
+- 浏览 `local`、所有 `s3[]` 和所有 `webdav[]` 配置对应的文件目录。
+- 上传文件到指定 local/S3/WebDAV 目标和当前目录。
 - 删除指定文件；目录只支持进入浏览，不支持直接删除。
-- 编辑 `config.json` 中的 key、rename、filePath、urlPrefix、host、port 和 S3 配置。
-- 新增、删除 S3 配置，并对单条 S3 配置执行连通性测试。
+- 编辑 `config.json` 中的 key、rename、filePath、urlPrefix、host、port、defaultTarget、S3 和 WebDAV 配置。
+- 新增、删除 S3/WebDAV 配置，并对单条远程配置执行连通性测试。
 
-保存配置后，服务会原子写入 `config.json` 并热更新 key、local 路径、S3 列表和当前选中后端。`host` 和 `port` 会写入配置文件，但当前进程监听地址不会改变，需要重启服务后生效。
+保存配置后，服务会原子写入 `config.json` 并热更新 key、local 路径、S3/WebDAV 列表和当前选中后端。`host` 和 `port` 会写入配置文件，但当前进程监听地址不会改变，需要重启服务后生效。
 
 如果 `KEY`、`PORT` 或 `FILEPATH` 环境变量存在，它们仍然优先于 `config.json`，管理界面会提示对应字段被环境变量覆盖。
 
@@ -216,14 +241,14 @@ curl -X POST "http://127.0.0.1:17788/upload?key=secret" \
   -F "file=@/path/to/demo.png"
 ```
 
-如果 `config.json` 中配置了多个 S3 目标并设置了 `s3[].name`，可以通过 `name` 指定本次上传目标：
+如果 `config.json` 中配置了多个 S3/WebDAV 目标并设置了 `name`，可以通过 `name` 指定本次上传目标：
 
 ```bash
 curl -X POST "http://127.0.0.1:17788/upload?key=secret&name=default" \
   -F "file=@/path/to/demo.png"
 ```
 
-`name=local` 会强制上传到本地存储；`path` 可以指定本次上传目录。当前目标是 S3 时，`path` 作为对象目录；当前目标是本地存储时，文件会写入 `filePath/path` 下：
+`name=local` 会强制上传到本地存储；`path` 可以指定本次上传目录。当前目标是 S3/WebDAV 时，`path` 作为对象目录；当前目标是本地存储时，文件会写入 `filePath/path` 下。S3 和 WebDAV 的 `name` 必须唯一，否则请求会返回名称歧义错误：
 
 ```bash
 curl -X POST "http://127.0.0.1:17788/upload?key=secret&name=local&path=path/to" \
@@ -296,7 +321,7 @@ curl "http://127.0.0.1:17788/list?path=xxx/yyy"
 | `url` | 文件访问地址；目录为空字符串 |
 | `size` | 文件大小；目录为 `0` |
 | `modTime` | 文件或目录的修改时间 |
-| `type` | 存储后端类型，例如 `local` 或 `aws-s3` |
+| `type` | 存储后端类型，例如 `local`、`aws-s3` 或 `webdav` |
 | `isDir` | `true` 表示目录，`false` 表示文件 |
 
 响应：
@@ -412,6 +437,11 @@ S3 存储：
 - 如果 S3 配置了 `urlPrefix`，返回 `urlPrefix + "/" + object_path`。
 - 如果配置了 `endpoint`，返回 `endpoint + "/" + bucket + "/" + object_path`。
 - 否则返回 AWS S3 默认 URL：`https://{bucket}.s3.{region}.amazonaws.com/{object_path}`。
+
+WebDAV 存储：
+
+- 如果 WebDAV 配置了 `urlPrefix`，返回 `urlPrefix + "/" + rootPath + "/" + object_path`。
+- 如果没有配置 `urlPrefix`，返回 `endpoint + "/" + rootPath + "/" + object_path`。
 
 ## 开发
 

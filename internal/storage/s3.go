@@ -12,6 +12,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"upimg/internal/config"
 	"upimg/internal/naming"
 )
@@ -87,6 +88,58 @@ func (s *S3) Delete(ctx context.Context, key string) error {
 	_, err = s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(s.cfg.Bucket),
 		Key:    aws.String(key),
+	})
+	return err
+}
+
+func (s *S3) DeleteDir(ctx context.Context, key string) error {
+	key, err := normalizeDirectoryKey(key)
+	if err != nil {
+		return err
+	}
+	prefix := strings.TrimRight(key, "/") + "/"
+	var batch []types.ObjectIdentifier
+	var token *string
+	for {
+		output, err := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(s.cfg.Bucket),
+			Prefix:            aws.String(prefix),
+			ContinuationToken: token,
+		})
+		if err != nil {
+			return err
+		}
+		for _, item := range output.Contents {
+			objectKey := aws.ToString(item.Key)
+			if objectKey == "" {
+				continue
+			}
+			batch = append(batch, types.ObjectIdentifier{Key: aws.String(objectKey)})
+			if len(batch) == 1000 {
+				if err := s.deleteObjects(ctx, batch); err != nil {
+					return err
+				}
+				batch = batch[:0]
+			}
+		}
+		if !aws.ToBool(output.IsTruncated) {
+			break
+		}
+		token = output.NextContinuationToken
+	}
+	if len(batch) > 0 {
+		return s.deleteObjects(ctx, batch)
+	}
+	return nil
+}
+
+func (s *S3) deleteObjects(ctx context.Context, objects []types.ObjectIdentifier) error {
+	if len(objects) == 0 {
+		return nil
+	}
+	_, err := s.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+		Bucket: aws.String(s.cfg.Bucket),
+		Delete: &types.Delete{Objects: objects, Quiet: aws.Bool(true)},
 	})
 	return err
 }

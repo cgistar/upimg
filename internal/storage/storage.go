@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"sort"
 	"strings"
@@ -33,10 +34,26 @@ type Backend interface {
 	List(ctx context.Context, baseURL, dir string) ([]Object, error)
 }
 
+type DirectoryCreator interface {
+	CreateDir(ctx context.Context, key string) error
+}
+
+type DirectoryDeleter interface {
+	DeleteDir(ctx context.Context, key string) error
+}
+
 func normalizeListDir(value string) (string, error) {
 	value = strings.TrimSpace(strings.ReplaceAll(value, "\\", "/"))
 	if strings.Trim(value, "/") == "" {
 		return "", nil
+	}
+	return naming.SafeRelative(value)
+}
+
+func normalizeDirectoryKey(value string) (string, error) {
+	value = strings.TrimSpace(strings.ReplaceAll(value, "\\", "/"))
+	if strings.Trim(value, "/") == "" {
+		return "", fmt.Errorf("directory path is empty")
 	}
 	return naming.SafeRelative(value)
 }

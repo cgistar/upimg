@@ -90,6 +90,43 @@ func (l *Local) Delete(ctx context.Context, key string) error {
 	return os.Remove(target)
 }
 
+func (l *Local) CreateDir(ctx context.Context, key string) error {
+	key, err := normalizeDirectoryKey(key)
+	if err != nil {
+		return err
+	}
+	target, err := l.safePath(key)
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return os.MkdirAll(target, 0o755)
+}
+
+func (l *Local) DeleteDir(ctx context.Context, key string) error {
+	key, err := normalizeDirectoryKey(key)
+	if err != nil {
+		return err
+	}
+	target, err := l.safePath(key)
+	if err != nil {
+		return err
+	}
+	info, err := os.Stat(target)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("target is not a directory")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return os.RemoveAll(target)
+}
+
 func (l *Local) FileURL(key, baseURL string) string {
 	key = strings.TrimLeft(strings.ReplaceAll(key, "\\", "/"), "/")
 	if baseURL == "" {

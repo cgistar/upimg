@@ -24,14 +24,15 @@ import (
 const maxUploadSize = 1024 * 1024 * 1024
 
 type App struct {
-	mu         sync.RWMutex
-	runtime    config.Runtime
-	backend    storage.Backend
-	local      storage.Backend
-	s3Targets  map[string]config.S3Config
-	s3Backends map[string]storage.Backend
-	s3Factory  func(context.Context, config.S3Config) (storage.Backend, error)
-	s3Mu       sync.Mutex
+	mu            sync.RWMutex
+	runtime       config.Runtime
+	backend       storage.Backend
+	local         storage.Backend
+	nameTargets   map[string][]namedTarget
+	backendCache  map[string]storage.Backend
+	s3Factory     func(context.Context, config.S3Config) (storage.Backend, error)
+	webdavFactory func(config.WebDAVConfig) (storage.Backend, error)
+	cacheMu       sync.Mutex
 
 	sessionMu  sync.Mutex
 	sessions   map[string]time.Time
@@ -64,10 +65,20 @@ type uploadJSON struct {
 	List []string `json:"list"`
 }
 
+type namedTarget struct {
+	ID     string
+	Type   string
+	S3     config.S3Config
+	WebDAV config.WebDAVConfig
+}
+
 func New(runtime config.Runtime, backend storage.Backend) *App {
 	app := &App{
 		s3Factory: func(ctx context.Context, cfg config.S3Config) (storage.Backend, error) {
 			return storage.NewS3(ctx, cfg)
+		},
+		webdavFactory: func(cfg config.WebDAVConfig) (storage.Backend, error) {
+			return storage.NewWebDAV(cfg)
 		},
 		sessions:      map[string]time.Time{},
 		sessionTTL:    24 * time.Hour,
@@ -113,10 +124,10 @@ func (a *App) setRuntime(runtime config.Runtime, backend storage.Backend) {
 	a.runtime = runtime
 	a.backend = backend
 	a.local = local
-	a.s3Targets = namedS3Targets(runtime.Config.S3)
-	a.s3Mu.Lock()
-	defer a.s3Mu.Unlock()
-	a.s3Backends = map[string]storage.Backend{}
+	a.nameTargets = namedTargets(runtime.Config)
+	a.cacheMu.Lock()
+	defer a.cacheMu.Unlock()
+	a.backendCache = map[string]storage.Backend{}
 	if keyChanged {
 		a.clearAdminSessions()
 	}
@@ -367,37 +378,41 @@ func (a *App) uploadBackend(r *http.Request) (storage.Backend, error) {
 		return local, nil
 	}
 	a.mu.RLock()
-	cfg, ok := a.s3Targets[name]
+	matches, ok := a.nameTargets[name]
 	a.mu.RUnlock()
-	if !ok {
-		return nil, fmt.Errorf("s3 config name %q not found", name)
+	if !ok || len(matches) == 0 {
+		return nil, fmt.Errorf("storage config name %q not found", name)
 	}
-	if !cfg.Valid() {
-		return nil, fmt.Errorf("s3 config name %q is invalid: missing %s", name, strings.Join(cfg.MissingFields(), ", "))
+	if len(matches) > 1 {
+		return nil, fmt.Errorf("storage config name %q is ambiguous", name)
 	}
-
-	a.s3Mu.Lock()
-	defer a.s3Mu.Unlock()
-	cacheKey := "name:" + name
-	if backend, ok := a.s3Backends[cacheKey]; ok {
-		return backend, nil
-	}
-	backend, err := a.s3Factory(r.Context(), cfg)
-	if err != nil {
-		return nil, fmt.Errorf("create s3 config name %q: %w", name, err)
-	}
-	a.s3Backends[cacheKey] = backend
-	return backend, nil
+	target := matches[0]
+	return a.backendByTarget(r.Context(), target.ID)
 }
 
-func namedS3Targets(items []config.S3Config) map[string]config.S3Config {
-	targets := map[string]config.S3Config{}
-	for _, item := range items {
+func namedTargets(cfg config.Config) map[string][]namedTarget {
+	targets := map[string][]namedTarget{}
+	for i, item := range cfg.S3 {
 		name := strings.TrimSpace(item.Name)
 		if name == "" {
 			continue
 		}
-		targets[name] = item
+		targets[name] = append(targets[name], namedTarget{
+			ID:   fmt.Sprintf("s3:%d", i),
+			Type: "aws-s3",
+			S3:   item,
+		})
+	}
+	for i, item := range cfg.WebDAV {
+		name := strings.TrimSpace(item.Name)
+		if name == "" {
+			continue
+		}
+		targets[name] = append(targets[name], namedTarget{
+			ID:     fmt.Sprintf("webdav:%d", i),
+			Type:   "webdav",
+			WebDAV: item,
+		})
 	}
 	return targets
 }
