@@ -403,7 +403,7 @@ func (s *SFTP) OpenReader(ctx context.Context, key string) (io.ReadCloser, error
 		_ = sshClient.Close()
 		return nil, err
 	}
-	return &sftpReadCloser{Reader: file, cleanup: func() error {
+	return &sftpReadCloser{ReadSeeker: file, cleanup: func() error {
 		err := file.Close()
 		if closeErr := client.Close(); err == nil {
 			err = closeErr
@@ -755,7 +755,7 @@ func isSSHExecUnsupported(err error) bool {
 }
 
 type sftpReadCloser struct {
-	io.Reader
+	io.ReadSeeker
 	cleanup func() error
 }
 

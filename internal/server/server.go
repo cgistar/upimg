@@ -40,8 +40,11 @@ type App struct {
 	sessions   map[string]time.Time
 	sessionTTL time.Duration
 
-	loginMu       sync.Mutex
-	loginFailures map[string]loginFailure
+	loginMu        sync.Mutex
+	loginFailures  map[string]loginFailure
+	previewLinkMu  sync.Mutex
+	previewLinks   map[string]adminPreviewLink
+	previewLinkTTL time.Duration
 }
 
 type UploadResult struct {
@@ -86,9 +89,11 @@ func New(runtime config.Runtime, backend storage.Backend) *App {
 		sftpFactory: func(cfg config.SFTPConfig) (storage.Backend, error) {
 			return storage.NewSFTP(cfg)
 		},
-		sessions:      map[string]time.Time{},
-		sessionTTL:    24 * time.Hour,
-		loginFailures: map[string]loginFailure{},
+		sessions:       map[string]time.Time{},
+		sessionTTL:     24 * time.Hour,
+		loginFailures:  map[string]loginFailure{},
+		previewLinks:   map[string]adminPreviewLink{},
+		previewLinkTTL: 10 * time.Minute,
 	}
 	app.setRuntime(runtime, backend)
 	return app
@@ -107,6 +112,7 @@ func (a *App) Handler() http.Handler {
 	}
 	mux.Handle("/admin/", adminHandler)
 	mux.HandleFunc("/api/admin/", a.handleAdminAPI)
+	mux.HandleFunc("/office-preview/", a.handleOfficePreviewFile)
 	mux.HandleFunc("/upload", a.handleUpload)
 	mux.HandleFunc("/delete/", a.handleDelete)
 	mux.HandleFunc("/files/", a.handleFiles)
@@ -137,6 +143,7 @@ func (a *App) setRuntime(runtime config.Runtime, backend storage.Backend) {
 	if keyChanged {
 		a.clearAdminSessions()
 	}
+	a.clearAdminPreviewLinks()
 }
 
 func (a *App) runtimeSnapshot() config.Runtime {
@@ -546,10 +553,14 @@ func baseURL(r *http.Request) string {
 		scheme = "https"
 	}
 	if forwarded := r.Header.Get("X-Forwarded-Proto"); forwarded != "" {
-		scheme = strings.Split(forwarded, ",")[0]
+		scheme = strings.TrimSpace(strings.Split(forwarded, ",")[0])
+	}
+	host := r.Host
+	if forwarded := r.Header.Get("X-Forwarded-Host"); forwarded != "" {
+		host = strings.TrimSpace(strings.Split(forwarded, ",")[0])
 	}
 	prefix := strings.TrimRight(requestBasePath(r), "/")
-	return scheme + "://" + r.Host + prefix
+	return scheme + "://" + host + prefix
 }
 
 func (a *App) withBasePath(next http.Handler) http.Handler {

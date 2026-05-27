@@ -11,6 +11,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"strconv"
@@ -26,11 +27,12 @@ import (
 )
 
 const (
-	adminSessionCookie  = "upimg_admin_session"
-	maxAdminPreviewSize = 2 << 20
-	maxLoginFailures    = 5
-	loginFailureWindow  = time.Minute
-	loginLockout        = time.Minute
+	adminSessionCookie   = "upimg_admin_session"
+	maxAdminPreviewSize  = 2 << 20
+	maxAdminSaveBodySize = maxAdminPreviewSize * 4
+	maxLoginFailures     = 5
+	loginFailureWindow   = time.Minute
+	loginLockout         = time.Minute
 )
 
 type loginFailure struct {
@@ -110,6 +112,11 @@ type adminRenameRequest struct {
 	Name string `json:"name"`
 }
 
+type adminSaveContentRequest struct {
+	Path    string `json:"path"`
+	Content string `json:"content"`
+}
+
 type adminExtractRequest struct {
 	Path      string `json:"path"`
 	Overwrite bool   `json:"overwrite"`
@@ -145,7 +152,26 @@ type adminRenameResponse struct {
 	Message string `json:"message,omitempty"`
 }
 
+type adminPreviewLinkResponse struct {
+	Success   bool      `json:"success"`
+	URL       string    `json:"url,omitempty"`
+	ExpiresAt time.Time `json:"expiresAt,omitempty"`
+	Message   string    `json:"message,omitempty"`
+}
+
+type adminPreviewLink struct {
+	Target  string
+	Path    string
+	Created time.Time
+	Expires time.Time
+}
+
 func (a *App) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/api/admin/storage/preview-file" || strings.HasPrefix(r.URL.Path, "/api/admin/storage/preview-file/") {
+		a.handlePreviewFile(w, r)
+		return
+	}
+
 	switch r.URL.Path {
 	case "/api/admin/login":
 		a.handleAdminLogin(w, r)
@@ -183,6 +209,11 @@ func (a *App) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a.handleAdminStorageObjectRename(w, r)
+	case "/api/admin/storage/object/content":
+		if !a.requireAdmin(w, r) {
+			return
+		}
+		a.handleAdminStorageObjectContent(w, r)
 	case "/api/admin/storage/object/extract":
 		if !a.requireAdmin(w, r) {
 			return
@@ -198,6 +229,11 @@ func (a *App) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a.handleAdminStoragePreview(w, r)
+	case "/api/admin/storage/preview-link":
+		if !a.requireAdmin(w, r) {
+			return
+		}
+		a.handleAdminStoragePreviewLink(w, r)
 	case "/api/admin/storage/download":
 		if !a.requireAdmin(w, r) {
 			return
@@ -504,6 +540,46 @@ func (a *App) handleAdminStorageObjectRename(w http.ResponseWriter, r *http.Requ
 	})
 }
 
+func (a *App) handleAdminStorageObjectContent(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		writeAdminStatus(w, http.StatusMethodNotAllowed, adminGenericResponse{Success: false, Message: "method not allowed"})
+		return
+	}
+	var payload adminSaveContentRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxAdminSaveBodySize)).Decode(&payload); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			writeAdminStatus(w, http.StatusRequestEntityTooLarge, adminGenericResponse{Success: false, Message: "content is too large"})
+			return
+		}
+		writeAdminStatus(w, http.StatusBadRequest, adminGenericResponse{Success: false, Message: "invalid json"})
+		return
+	}
+	if isDirectoryDeletePath(payload.Path) {
+		writeAdminStatus(w, http.StatusBadRequest, adminGenericResponse{Success: false, Message: "directory editing is not supported"})
+		return
+	}
+	key, err := naming.SafeRelative(payload.Path)
+	if err != nil {
+		writeAdminStatus(w, http.StatusBadRequest, adminGenericResponse{Success: false, Message: err.Error()})
+		return
+	}
+	if len(payload.Content) > maxAdminPreviewSize {
+		writeAdminStatus(w, http.StatusRequestEntityTooLarge, adminGenericResponse{Success: false, Message: "content is too large"})
+		return
+	}
+	backend, err := a.adminBackend(r.Context(), r.URL.Query().Get("target"))
+	if err != nil {
+		writeAdminStatus(w, http.StatusBadRequest, adminGenericResponse{Success: false, Message: err.Error()})
+		return
+	}
+	if _, err := backend.Put(r.Context(), key, path.Base(key), strings.NewReader(payload.Content)); err != nil {
+		writeAdminStatus(w, http.StatusBadRequest, adminGenericResponse{Success: false, Message: err.Error()})
+		return
+	}
+	writeAdmin(w, adminGenericResponse{Success: true, Message: "saved"})
+}
+
 func (a *App) handleAdminStorageObjectExtract(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeAdminStatus(w, http.StatusMethodNotAllowed, adminGenericResponse{Success: false, Message: "method not allowed"})
@@ -623,6 +699,206 @@ func (a *App) handleAdminStoragePreview(w http.ResponseWriter, r *http.Request) 
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(data)
+}
+
+func (a *App) handleAdminStoragePreviewLink(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeAdminStatus(w, http.StatusMethodNotAllowed, adminPreviewLinkResponse{Success: false, Message: "method not allowed"})
+		return
+	}
+	link, status, err := a.createAdminPreviewLink(r.Context(), r.URL.Query().Get("target"), r.URL.Query().Get("path"))
+	if err != nil {
+		writeAdminStatus(w, status, adminPreviewLinkResponse{Success: false, Message: err.Error()})
+		return
+	}
+	writeAdmin(w, adminPreviewLinkResponse{
+		Success:   true,
+		URL:       absoluteAdminPreviewFileURL(r, link.Token, link.Path),
+		ExpiresAt: link.Expires,
+	})
+}
+
+func (a *App) handleOfficePreviewFile(w http.ResponseWriter, r *http.Request) {
+	a.handlePreviewFile(w, r)
+}
+
+func (a *App) handlePreviewFile(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeAdminStatus(w, http.StatusMethodNotAllowed, adminGenericResponse{Success: false, Message: "method not allowed"})
+		return
+	}
+	link, ok := a.adminPreviewLink(adminPreviewFileToken(r))
+	if !ok {
+		writeAdminStatus(w, http.StatusUnauthorized, adminGenericResponse{Success: false, Message: "preview link is invalid or expired"})
+		return
+	}
+	backend, err := a.adminBackend(r.Context(), link.Target)
+	if err != nil {
+		writeAdminStatus(w, http.StatusBadRequest, adminGenericResponse{Success: false, Message: err.Error()})
+		return
+	}
+	readerBackend, ok := backend.(interface {
+		OpenReader(context.Context, string) (io.ReadCloser, error)
+	})
+	if !ok {
+		writeAdminStatus(w, http.StatusBadRequest, adminGenericResponse{Success: false, Message: "preview is not supported"})
+		return
+	}
+	reader, err := readerBackend.OpenReader(r.Context(), link.Path)
+	if err != nil {
+		writeAdminStatus(w, http.StatusNotFound, adminGenericResponse{Success: false, Message: "file not found"})
+		return
+	}
+	defer reader.Close()
+
+	fileName := path.Base(link.Path)
+	if seeker, ok := reader.(io.ReadSeeker); ok {
+		setInlineFileHeaders(w, fileName, link)
+		http.ServeContent(w, r, fileName, time.Time{}, seeker)
+		return
+	}
+
+	tempFile, err := os.CreateTemp("", "upimg-preview-*")
+	if err != nil {
+		writeAdminStatus(w, http.StatusInternalServerError, adminGenericResponse{Success: false, Message: "create preview file failed"})
+		return
+	}
+	defer func() {
+		_ = tempFile.Close()
+		_ = os.Remove(tempFile.Name())
+	}()
+	if _, err := io.Copy(tempFile, reader); err != nil {
+		writeAdminStatus(w, http.StatusInternalServerError, adminGenericResponse{Success: false, Message: "read preview file failed"})
+		return
+	}
+	if _, err := tempFile.Seek(0, io.SeekStart); err != nil {
+		writeAdminStatus(w, http.StatusInternalServerError, adminGenericResponse{Success: false, Message: "read preview file failed"})
+		return
+	}
+	setInlineFileHeaders(w, fileName, link)
+	http.ServeContent(w, r, fileName, time.Time{}, tempFile)
+}
+
+func setInlineFileHeaders(w http.ResponseWriter, fileName string, link adminPreviewLink) {
+	if contentType := mime.TypeByExtension(path.Ext(fileName)); contentType != "" {
+		w.Header().Set("Content-Type", contentType)
+	} else {
+		w.Header().Set("Content-Type", "application/octet-stream")
+	}
+	w.Header().Set("Cache-Control", "public, max-age="+strconv.Itoa(previewCacheMaxAge(link.Expires)))
+	w.Header().Set("Content-Disposition", "inline; filename="+strconv.Quote(fileName)+"; filename*=utf-8''"+url.PathEscape(fileName))
+	w.Header().Set("Content-Transfer-Encoding", "binary")
+	w.Header().Set("ETag", strconv.Quote(linkETag(link)))
+	w.Header().Set("Last-Modified", previewLastModified(link).UTC().Format(http.TimeFormat))
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+}
+
+func previewCacheMaxAge(expires time.Time) int {
+	seconds := int(time.Until(expires).Seconds())
+	if seconds < 0 {
+		return 0
+	}
+	return seconds
+}
+
+func linkETag(link adminPreviewLink) string {
+	return link.Path + ":" + link.Expires.UTC().Format(time.RFC3339Nano)
+}
+
+func previewLastModified(link adminPreviewLink) time.Time {
+	if !link.Created.IsZero() {
+		return link.Created
+	}
+	return link.Expires
+}
+
+type issuedAdminPreviewLink struct {
+	Token   string
+	Path    string
+	Expires time.Time
+}
+
+func (a *App) createAdminPreviewLink(ctx context.Context, target, rawPath string) (issuedAdminPreviewLink, int, error) {
+	if isDirectoryDeletePath(rawPath) {
+		return issuedAdminPreviewLink{}, http.StatusBadRequest, fmt.Errorf("directory preview is not supported")
+	}
+	key, err := naming.SafeRelative(rawPath)
+	if err != nil {
+		return issuedAdminPreviewLink{}, http.StatusBadRequest, err
+	}
+	backend, err := a.adminBackend(ctx, target)
+	if err != nil {
+		return issuedAdminPreviewLink{}, http.StatusBadRequest, err
+	}
+	if _, ok := backend.(interface {
+		OpenReader(context.Context, string) (io.ReadCloser, error)
+	}); !ok {
+		return issuedAdminPreviewLink{}, http.StatusBadRequest, fmt.Errorf("preview is not supported")
+	}
+	token, err := randomToken()
+	if err != nil {
+		return issuedAdminPreviewLink{}, http.StatusInternalServerError, fmt.Errorf("create preview link failed")
+	}
+	now := time.Now()
+	expires := now.Add(a.previewLinkTTL)
+	a.previewLinkMu.Lock()
+	a.pruneAdminPreviewLinksLocked(now)
+	a.previewLinks[token] = adminPreviewLink{Target: strings.TrimSpace(target), Path: key, Created: now, Expires: expires}
+	a.previewLinkMu.Unlock()
+	return issuedAdminPreviewLink{Token: token, Path: key, Expires: expires}, http.StatusOK, nil
+}
+
+func (a *App) adminPreviewLink(token string) (adminPreviewLink, bool) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return adminPreviewLink{}, false
+	}
+	now := time.Now()
+	a.previewLinkMu.Lock()
+	defer a.previewLinkMu.Unlock()
+	link, ok := a.previewLinks[token]
+	if !ok {
+		return adminPreviewLink{}, false
+	}
+	if now.After(link.Expires) {
+		delete(a.previewLinks, token)
+		return adminPreviewLink{}, false
+	}
+	return link, true
+}
+
+func (a *App) pruneAdminPreviewLinksLocked(now time.Time) {
+	for token, link := range a.previewLinks {
+		if now.After(link.Expires) {
+			delete(a.previewLinks, token)
+		}
+	}
+}
+
+func (a *App) clearAdminPreviewLinks() {
+	a.previewLinkMu.Lock()
+	defer a.previewLinkMu.Unlock()
+	a.previewLinks = map[string]adminPreviewLink{}
+}
+
+func absoluteAdminPreviewFileURL(r *http.Request, token, filePath string) string {
+	fileName := path.Base(filePath)
+	if strings.TrimSpace(fileName) == "" || fileName == "." || fileName == "/" {
+		fileName = "preview"
+	}
+	return baseURL(r) + "/office-preview/" + url.PathEscape(token) + "/" + url.PathEscape(fileName)
+}
+
+func adminPreviewFileToken(r *http.Request) string {
+	for _, prefix := range []string{"/office-preview/", "/api/admin/storage/preview-file/"} {
+		if !strings.HasPrefix(r.URL.Path, prefix) {
+			continue
+		}
+		rest := strings.TrimPrefix(r.URL.Path, prefix)
+		token, _, _ := strings.Cut(rest, "/")
+		return token
+	}
+	return ""
 }
 
 func (a *App) handleAdminStorageDownload(w http.ResponseWriter, r *http.Request) {

@@ -7,13 +7,13 @@ services:
     container_name: upimg
     restart: unless-stopped
     ports:
-      - "17788:17788"
+      - '${HOST_PORT:-17788}:${PORT:-17788}'
     environment:
-      DATA: /data
-      FILEPATH: /data/files
-      PORT: 17788
+      DATA: '/data'
+      FILEPATH: '${FILEPATH:-/data/files}'
+      PORT: '${PORT:-17788}'
       # 如需覆盖 config.json 中的 key，可取消注释：
-      # KEY: secret
+      # KEY: '${KEY:-secret}'
     volumes:
-      - ./data:/data
-      - /home/upimg:/data/files
+      - '${DATA_DIR:-./data}:/data'
+      - '${FILES_DIR:-/home/upimg}:/data/files'

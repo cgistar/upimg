@@ -1,7 +1,10 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { createRoot } from 'react-dom/client';
-import { ArchiveRestore, Check, ChevronDown, Eraser, FilePenLine, FolderOpen, Link2, LogOut, Maximize2, Minimize2, OctagonX, Settings, SquarePen, Terminal, X } from 'lucide-react';
+import { ArchiveRestore, Check, ChevronDown, Code2, Eraser, FilePenLine, FolderOpen, Link2, LogOut, Maximize2, Minimize2, OctagonX, Save, Settings, SquarePen, Terminal, X } from 'lucide-react';
+import MonacoEditor from '@monaco-editor/react';
+import 'highlight.js/styles/github.css';
+import 'katex/dist/katex.min.css';
 import './styles.css';
 
 const emptyConfig = {
@@ -75,6 +78,11 @@ const fieldLabels = {
   passphrase: '私钥口令',
 };
 
+const MERMAID_PATTERN = /```mermaid[\s\S]*?```/i;
+const MATH_PATTERN = /\$\$[\s\S]+?\$\$|\$[^$\n]+?\$/;
+const FENCED_CODE_PATTERN = /(^|\n)```[\s\S]*?```/;
+const MARKDOWN_TABLE_PATTERN = /(^|\n)\s*\|.+\|\s*\n\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*(\n|$)/;
+
 async function api(path, options = {}) {
   const headers = options.body instanceof FormData ? {} : { 'Content-Type': 'application/json' };
   const response = await fetch(`${adminAPIBase()}${path}`, {
@@ -130,6 +138,15 @@ function uploadFileWithProgress(file, target, dir, onProgress) {
   });
 }
 
+function hasRuntimeOverrides(runtime) {
+  return Boolean(
+    runtime?.keyOverridden ||
+    runtime?.portOverridden ||
+    runtime?.basePathOverridden ||
+    runtime?.filePathOverridden,
+  );
+}
+
 function parseJSON(value) {
   try {
     return JSON.parse(value);
@@ -145,6 +162,11 @@ function adminAPIBase() {
 function adminStorageDownloadURL(target, objectPath) {
   const params = new URLSearchParams({ target, path: objectPath });
   return `${adminAPIBase()}/storage/download?${params}`;
+}
+
+async function adminStoragePreviewLink(target, objectPath) {
+  const params = new URLSearchParams({ target, path: objectPath });
+  return api(`/storage/preview-link?${params}`, { method: 'POST' });
 }
 
 function adminSFTPTerminalURL(target) {
@@ -185,7 +207,11 @@ function App() {
   const [virtualFolders, setVirtualFolders] = useState([]);
   const [busy, setBusy] = useState(false);
   const listRequestRef = useRef(0);
+  const systemWarningRef = useRef('');
   const authenticated = session?.authenticated;
+  const keyConfigured = session?.keyConfigured;
+  const configLoaded = Boolean(configState);
+  const runtimeOverridden = hasRuntimeOverrides(configState?.runtime);
 
   useEffect(() => {
     api('/session')
@@ -220,6 +246,27 @@ function App() {
     const timer = window.setTimeout(() => setError(''), 4200);
     return () => window.clearTimeout(timer);
   }, [error]);
+
+  useEffect(() => {
+    if (!authenticated || !configLoaded) return;
+    const warnings = [];
+    if (!keyConfigured) {
+      warnings.push('当前未配置 key，管理界面处于免登录状态。');
+    }
+    const nextWarning = warnings.join(' ');
+    if (!nextWarning) {
+      systemWarningRef.current = '';
+      return;
+    }
+    if (systemWarningRef.current === nextWarning) return;
+    systemWarningRef.current = nextWarning;
+    setWarning(nextWarning);
+  }, [
+    authenticated,
+    configLoaded,
+    keyConfigured,
+    runtimeOverridden,
+  ]);
 
   const visibleObjects = useMemo(
     () => mergeVirtualFolders(objects, virtualFolders, selectedTarget, path),
@@ -400,13 +447,9 @@ function App() {
           }}
         />
       )}
-      {!session.keyConfigured && <div className="notice warn">当前未配置 key，管理界面处于免登录状态。</div>}
-      {(configState.runtime.keyOverridden || configState.runtime.portOverridden || configState.runtime.basePathOverridden || configState.runtime.filePathOverridden) && (
-        <div className="notice warn">检测到环境变量覆盖，保存 config.json 不会覆盖对应运行时值。</div>
-      )}
-
       {view === 'files' ? (
         <FilePanel
+          config={configState.config}
           selectedTarget={selectedTarget}
           path={path}
           setPath={setPath}
@@ -458,6 +501,15 @@ function App() {
               return;
             }
             setMessage('文件名已更新');
+            await loadObjects(selectedTarget, path);
+          }}
+          onSaveContent={async (sourcePath, content) => {
+            const params = new URLSearchParams({ target: selectedTarget });
+            await api(`/storage/object/content?${params}`, {
+              method: 'PUT',
+              body: JSON.stringify({ path: sourcePath, content }),
+            });
+            setMessage('文件已保存');
             await loadObjects(selectedTarget, path);
           }}
           onExtract={async (item) => {
@@ -531,9 +583,10 @@ function Toast({ type, message }) {
   );
 }
 
-function FilePanel({ selectedTarget, path, setPath, objects, busy, onRefresh, onCreateFolder, onUpload, onBatchDelete, onRename, onExtract, onMessage, onError, onConfirm }) {
+function FilePanel({ config, selectedTarget, path, setPath, objects, busy, onRefresh, onCreateFolder, onUpload, onBatchDelete, onRename, onSaveContent, onExtract, onMessage, onError, onConfirm }) {
   const [browserMode, setBrowserMode] = useState('list');
   const [preview, setPreview] = useState(null);
+  const [editorState, setEditorState] = useState(null);
   const [folderDialog, setFolderDialog] = useState(false);
   const [dragActive, setDragActive] = useState(false);
   const [pathInput, setPathInput] = useState(path);
@@ -596,10 +649,47 @@ function FilePanel({ selectedTarget, path, setPath, objects, busy, onRefresh, on
     return selectedTarget.startsWith('sftp:') && !item.special && !item.isDir && isArchiveFile(item);
   }
 
+  function canEditContent(item) {
+    return !item.special && isTextFile(item);
+  }
+
   function beginRename(event, item) {
     event.stopPropagation();
     if (!canRename(item)) return;
     setRenameState({ path: item.path, name: item.displayName, saving: false });
+  }
+
+  async function beginEditContent(event, item) {
+    event.stopPropagation();
+    if (!canEditContent(item)) return;
+    const nextEditor = {
+      title: item.displayName,
+      target: selectedTarget,
+      path: item.path,
+      language: editorLanguageForPath(item.path),
+      content: '',
+      draft: '',
+      loading: true,
+      saving: false,
+      error: '',
+      saved: false,
+    };
+    setEditorState(nextEditor);
+    try {
+      const params = new URLSearchParams({ target: selectedTarget, path: item.path });
+      const response = await apiRaw(`/storage/preview?${params}`);
+      const text = await response.text();
+      setEditorState((current) => (
+        current?.target === selectedTarget && current?.path === item.path
+          ? { ...current, content: text, draft: text, loading: false }
+          : current
+      ));
+    } catch (err) {
+      setEditorState((current) => (
+        current?.target === selectedTarget && current?.path === item.path ? null : current
+      ));
+      onError(`打开编辑器失败：${err.message}`);
+    }
   }
 
   function confirmExtract(event, item) {
@@ -649,6 +739,26 @@ function FilePanel({ selectedTarget, path, setPath, objects, busy, onRefresh, on
     }
   }
 
+  async function saveEditorContent() {
+    if (!editorState || editorState.loading || editorState.saving) return;
+    setEditorState((current) => (current ? { ...current, saving: true, error: '', saved: false } : current));
+    try {
+      await onSaveContent(editorState.path, editorState.draft);
+      setEditorState((current) => (
+        current?.target === editorState.target && current?.path === editorState.path
+          ? { ...current, content: editorState.draft, saving: false, saved: true }
+          : current
+      ));
+    } catch (err) {
+      setEditorState((current) => (
+        current?.target === editorState.target && current?.path === editorState.path
+          ? { ...current, saving: false, error: err.message || '保存失败' }
+          : current
+      ));
+      onError(`保存失败：${err.message}`);
+    }
+  }
+
   function renderEntryName(item, mode) {
     const editing = renameState?.path === item.path;
     if (editing) {
@@ -677,11 +787,16 @@ function FilePanel({ selectedTarget, path, setPath, objects, busy, onRefresh, on
         <button className={mode === 'thumb' ? 'thumb-name' : 'name-button'} onClick={() => openEntry(item)}>
           <span>{item.displayName}</span>
         </button>
-        {(canRename(item) || canCopyURL(item) || canExtract(item)) && (
+        {(canRename(item) || canEditContent(item) || canCopyURL(item) || canExtract(item)) && (
           <span className="file-inline-actions">
             {canRename(item) && (
               <button className="tiny-icon" type="button" onClick={(event) => beginRename(event, item)} aria-label="重命名文件" title="重命名文件">
                 <FilePenLine size={11} strokeWidth={2.3} />
+              </button>
+            )}
+            {canEditContent(item) && (
+              <button className="tiny-icon" type="button" onClick={(event) => beginEditContent(event, item)} aria-label="编辑文件内容" title="编辑文件内容">
+                <SquarePen size={11} strokeWidth={2.3} />
               </button>
             )}
             {canCopyURL(item) && (
@@ -710,25 +825,57 @@ function FilePanel({ selectedTarget, path, setPath, objects, busy, onRefresh, on
       changePath(item.path.replace(/\/$/, ''));
       return;
     }
-    if (!item.url) return;
-    if (isImage(item)) {
-      setPreview({ type: 'image', title: item.displayName, url: item.url });
-      return;
-    }
     if (isTextFile(item)) {
-      setPreview({ type: 'text', title: item.displayName, loading: true });
+      const previewType = isMarkdownFile(item) ? 'markdown' : 'text';
+      setPreview({ type: previewType, title: item.displayName, target: selectedTarget, path: item.path, loading: true });
       try {
         const params = new URLSearchParams({ target: selectedTarget, path: item.path });
         const response = await apiRaw(`/storage/preview?${params}`);
         const text = await response.text();
-        setPreview({ type: 'text', title: item.displayName, text });
+        const renderedType = shouldRenderAsMarkdown(item, text) ? 'markdown' : 'text';
+        setPreview({ type: renderedType, title: item.displayName, target: selectedTarget, path: item.path, text });
       } catch (err) {
         setPreview(null);
         onError(`预览失败：${err.message}`);
       }
       return;
     }
-    window.open(item.url, '_blank', 'noopener,noreferrer');
+    if (isImage(item)) {
+      setPreview({ type: 'image', title: item.displayName, url: item.url });
+      return;
+    }
+    if (isPDFFile(item) || isOfficeFile(item)) {
+      if (isPublicHTTPURL(item.url)) {
+        if (isPDFFile(item)) {
+          setPreview({ type: 'pdf', title: item.displayName, url: item.url });
+          return;
+        }
+        window.open(microsoftOfficeViewerURL(item.url), '_blank', 'noopener,noreferrer');
+        return;
+      }
+      try {
+        const data = await adminStoragePreviewLink(selectedTarget, item.path);
+        if (isPDFFile(item)) {
+          setPreview({ type: 'pdf', title: item.displayName, url: data.url });
+          return;
+        }
+        if (isPrivateNetworkURL(data.url)) {
+          onError('Office 在线预览需要公网可访问的临时链接，请通过公网域名访问管理后台或配置反向代理 Host。');
+          return;
+        }
+        window.open(microsoftOfficeViewerURL(data.url), '_blank', 'noopener,noreferrer');
+      } catch (err) {
+        onError(`预览失败：${err.message}`);
+      }
+      return;
+    }
+    if (!item.url) return;
+    if (hasConfiguredURLPrefix(config, selectedTarget) && isHTTPURL(item.url)) {
+      if (isVideoFile(item)) {
+        setPreview({ type: 'video', title: item.displayName, url: item.url });
+        return;
+      }
+    }
   }
 
   function togglePath(pathValue) {
@@ -962,6 +1109,16 @@ function FilePanel({ selectedTarget, path, setPath, objects, busy, onRefresh, on
         />
       )}
       {preview && <PreviewDialog preview={preview} onClose={() => setPreview(null)} />}
+      {editorState && (
+        <EditorDialog
+          editor={editorState}
+          onChange={(draft) => {
+            setEditorState((current) => (current ? { ...current, draft, saved: false, error: '' } : current));
+          }}
+          onSave={saveEditorContent}
+          onClose={() => setEditorState(null)}
+        />
+      )}
       {commandDialog && (
         <CommandDialog
           target={selectedTarget}
@@ -1062,6 +1219,29 @@ function ConfigPanel({ configState, selectedTarget, setSelectedTarget, onSaved, 
     await persistConfig(nextDraft);
     setSelectedTarget(`sftp:${createdIndex}`);
     setServiceDialog(null);
+  }
+
+  async function cloneService(values) {
+    if (selectedTarget === 'local') return;
+    let nextDraft = draft;
+    let nextTarget = selectedTarget;
+    if (selectedTarget.startsWith('s3:')) {
+      const nextS3 = [...(draft.s3 || []), { ...values }];
+      nextDraft = { ...draft, s3: nextS3 };
+      nextTarget = `s3:${nextS3.length - 1}`;
+    } else if (selectedTarget.startsWith('webdav:')) {
+      const nextWebDAV = [...(draft.webdav || []), { ...values }];
+      nextDraft = { ...draft, webdav: nextWebDAV };
+      nextTarget = `webdav:${nextWebDAV.length - 1}`;
+    } else if (selectedTarget.startsWith('sftp:')) {
+      const nextSFTP = [...(draft.sftp || []), { ...values }];
+      nextDraft = { ...draft, sftp: nextSFTP };
+      nextTarget = `sftp:${nextSFTP.length - 1}`;
+    }
+    await persistConfig(syncDefaultTarget(nextDraft, effectiveDefaultTarget(draft)));
+    setSelectedTarget(nextTarget);
+    setServiceDialog(null);
+    onMessage('文件服务已克隆');
   }
 
   async function deleteService() {
@@ -1245,6 +1425,8 @@ function ConfigPanel({ configState, selectedTarget, setSelectedTarget, onSaved, 
           sftpValues={serviceDialog.mode === 'create-sftp' ? emptySFTP : selectedSFTP}
           onCancel={() => setServiceDialog(null)}
           onSave={serviceDialog.mode === 'create-s3' ? createS3 : serviceDialog.mode === 'create-webdav' ? createWebDAV : serviceDialog.mode === 'create-sftp' ? createSFTP : saveService}
+          onClone={cloneService}
+          onCloneName={(name) => cloneServiceName(name || selectedServiceName, draft)}
           onDelete={deleteService}
           onMessage={onMessage}
           onWarn={onWarn}
@@ -1255,7 +1437,7 @@ function ConfigPanel({ configState, selectedTarget, setSelectedTarget, onSaved, 
   );
 }
 
-function ServiceConfigDialog({ title, mode, target, runtime, localValues, s3Values, webdavValues, sftpValues, onCancel, onSave, onDelete, onMessage, onWarn, onError }) {
+function ServiceConfigDialog({ title, mode, target, runtime, localValues, s3Values, webdavValues, sftpValues, onCancel, onSave, onClone, onCloneName, onDelete, onMessage, onWarn, onError }) {
   const isCreateS3 = mode === 'create-s3';
   const isCreateWebDAV = mode === 'create-webdav';
   const isCreateSFTP = mode === 'create-sftp';
@@ -1265,10 +1447,12 @@ function ServiceConfigDialog({ title, mode, target, runtime, localValues, s3Valu
   const remoteDefaults = isSFTP ? emptySFTP : isWebDAV ? emptyWebDAV : emptyS3;
   const remoteValues = isSFTP ? sftpValues : isWebDAV ? webdavValues : s3Values;
   const [values, setValues] = useState(isLocal ? localValues : { ...remoteDefaults, ...(remoteValues || {}) });
+  const [cloneDraft, setCloneDraft] = useState(false);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [pendingHostKeyFingerprint, setPendingHostKeyFingerprint] = useState('');
   const [hostKeyConfirm, setHostKeyConfirm] = useState(false);
+  const canClone = !cloneDraft && !isLocal && !isCreateS3 && !isCreateWebDAV && !isCreateSFTP && typeof onClone === 'function';
   const valuesRef = useRef(values);
   useEffect(() => {
     valuesRef.current = values;
@@ -1310,13 +1494,25 @@ function ServiceConfigDialog({ title, mode, target, runtime, localValues, s3Valu
       if (isSFTP && !String(valuesRef.current.hostKeyFingerprint || '').trim()) {
         throw new Error('请先测试连通性并接受服务器指纹');
       }
-      await onSave(valuesRef.current);
+      await (cloneDraft ? onClone : onSave)(valuesRef.current);
     } catch (err) {
       failed = true;
       onError(err.message);
     } finally {
       if (failed) setSaving(false);
     }
+  }
+
+  async function handleClone() {
+    if (!canClone) return;
+    const nextValues = {
+      ...valuesRef.current,
+      name: typeof onCloneName === 'function' ? onCloneName(valuesRef.current.name) : `${valuesRef.current.name || '文件服务'}克隆`,
+    };
+    valuesRef.current = nextValues;
+    setValues(nextValues);
+    setCloneDraft(true);
+    onMessage('已生成克隆副本，请确认后保存');
   }
 
   async function handleDelete() {
@@ -1396,10 +1592,11 @@ function ServiceConfigDialog({ title, mode, target, runtime, localValues, s3Valu
         )}
 
         <div className="row-actions">
-          {!isLocal && !isCreateS3 && !isCreateWebDAV && !isCreateSFTP && <button className="danger" disabled={saving} onClick={handleDelete}>{saving ? '删除中...' : '删除配置'}</button>}
+          {!cloneDraft && !isLocal && !isCreateS3 && !isCreateWebDAV && !isCreateSFTP && <button className="danger" disabled={saving} onClick={handleDelete}>{saving ? '删除中...' : '删除配置'}</button>}
+          {canClone && <button className="ghost" disabled={saving} onClick={handleClone}>{saving ? '处理中...' : '克隆'}</button>}
           {!isLocal && <button className="ghost" disabled={testing || saving} onClick={testRemote}>{testing ? '测试中...' : '测试连通性'}</button>}
           <button className="ghost" disabled={saving} onClick={onCancel}>取消</button>
-          <button disabled={saving} onClick={handleSave}>{saving ? '保存中...' : '保存'}</button>
+          <button disabled={saving} onClick={handleSave}>{saving ? '保存中...' :'保存'}</button>
         </div>
         {hostKeyConfirm && (
           <ConfirmDialog
@@ -1543,6 +1740,10 @@ function CommandDialog({ target, path, onClose, onError, onMessage }) {
     setHistoryOpen(false);
   }
 
+  function removeHistory(item) {
+    setHistory((current) => removeCommandHistory(item, current));
+  }
+
   function runCommand(event) {
     event.preventDefault();
     const nextCommand = command.trim();
@@ -1621,9 +1822,24 @@ function CommandDialog({ target, path, onClose, onError, onMessage }) {
                     <div className="path-history-empty">暂无历史命令</div>
                   ) : (
                     history.map((item) => (
-                      <button key={item} type="button" role="option" onMouseDown={() => selectHistory(item)}>
-                        {item}
-                      </button>
+                      <div className="command-history-item" key={item}>
+                        <button className="command-history-select" type="button" role="option" onMouseDown={() => selectHistory(item)}>
+                          {item}
+                        </button>
+                        <button
+                          className="command-history-remove"
+                          type="button"
+                          onMouseDown={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            removeHistory(item);
+                          }}
+                          aria-label={`删除历史命令：${item}`}
+                          title="删除历史命令"
+                        >
+                          <X size={14} strokeWidth={2.4} />
+                        </button>
+                      </div>
                     ))
                   )}
                 </div>
@@ -1679,6 +1895,16 @@ function loadCommandHistory() {
 
 function saveCommandHistory(command, current) {
   const next = [command, ...current.filter((item) => item !== command)].slice(0, 20);
+  try {
+    window.localStorage.setItem(commandHistoryKey, JSON.stringify(next));
+  } catch {
+    // 历史记录只是便捷能力，存储失败不影响命令执行。
+  }
+  return next;
+}
+
+function removeCommandHistory(command, current) {
+  const next = current.filter((item) => item !== command);
   try {
     window.localStorage.setItem(commandHistoryKey, JSON.stringify(next));
   } catch {
@@ -1806,10 +2032,93 @@ function uploadStatusText(item) {
   return '等待中';
 }
 
+function EditorDialog({ editor, onChange, onSave, onClose }) {
+  const [isMaximized, setIsMaximized] = useState(false);
+  const dirty = editor.draft !== editor.content;
+
+  useEffect(() => {
+    function handleKeyDown(event) {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's') {
+        event.preventDefault();
+        if (dirty && !editor.loading && !editor.saving) onSave();
+        return;
+      }
+      if (event.key === 'Escape') onClose();
+    }
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [dirty, editor.loading, editor.saving, onClose, onSave]);
+
+  return createPortal(
+    <div className="dialog-backdrop preview-backdrop" role="presentation">
+      <section className={`dialog editor-dialog${isMaximized ? ' is-maximized' : ''}`} role="dialog" aria-modal="true" aria-labelledby="editor-title">
+        <div className="preview-head">
+          <div>
+            <p className="eyebrow">editor <span>{editor.path}</span></p>
+            <h3 id="editor-title">{editor.title}</h3>
+          </div>
+          <div className="preview-window-actions">
+            <button
+              className="window-icon-button"
+              type="button"
+              aria-label="保存文件"
+              title="保存"
+              disabled={editor.loading || editor.saving || !dirty}
+              onClick={onSave}
+            >
+              <Save size={17} strokeWidth={2.2} />
+            </button>
+            <button
+              className="window-icon-button"
+              type="button"
+              aria-label={isMaximized ? '还原编辑器窗口' : '全屏编辑器窗口'}
+              title={isMaximized ? '还原' : '全屏'}
+              onClick={() => setIsMaximized((current) => !current)}
+            >
+              {isMaximized ? <Minimize2 size={17} strokeWidth={2.2} /> : <Maximize2 size={17} strokeWidth={2.2} />}
+            </button>
+            <button className="icon-close" aria-label="关闭编辑器" title="关闭" onClick={onClose}>×</button>
+          </div>
+        </div>
+        <div className="editor-status" aria-live="polite">
+          {editor.loading && <span>正在加载文件内容...</span>}
+          {!editor.loading && dirty && !editor.error && <span>有未保存修改，按 Ctrl/⌘ + S 可保存。</span>}
+          {!editor.loading && !dirty && editor.saved && <span className="ok">已保存</span>}
+          {editor.error && <span className="bad">{editor.error}</span>}
+        </div>
+        <div className="monaco-editor-wrap">
+          {editor.loading ? (
+            <p className="muted">正在准备编辑器...</p>
+          ) : (
+            <MonacoEditor
+              height="100%"
+              language={editor.language}
+              theme="vs"
+              value={editor.draft}
+              options={{
+                automaticLayout: true,
+                fontSize: 14,
+                minimap: { enabled: false },
+                readOnly: editor.saving,
+                scrollBeyondLastLine: false,
+                wordWrap: 'on',
+              }}
+              onChange={(value) => onChange(value ?? '')}
+            />
+          )}
+        </div>
+      </section>
+    </div>,
+    document.body,
+  );
+}
+
 function PreviewDialog({ preview, onClose }) {
   const [imageScale, setImageScale] = useState(1);
   const [imageOffset, setImageOffset] = useState({ x: 0, y: 0 });
   const [dragStart, setDragStart] = useState(null);
+  const [isMaximized, setIsMaximized] = useState(false);
+  const [textRenderMode, setTextRenderMode] = useState('source');
 
   useEffect(() => {
     function handleKeyDown(event) {
@@ -1818,6 +2127,13 @@ function PreviewDialog({ preview, onClose }) {
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [onClose]);
+
+  useEffect(() => {
+    setTextRenderMode(preview.type === 'markdown' ? 'markdown' : 'source');
+  }, [preview.path, preview.type]);
+
+  const canTogglePreviewMode = (preview.type === 'text' || preview.type === 'markdown') && typeof preview.text === 'string';
+  const nextPreviewMode = textRenderMode === 'markdown' ? 'source' : 'markdown';
 
   function zoom(delta) {
     setImageScale((current) => Math.min(5, Math.max(0.2, Number((current + delta).toFixed(2)))));
@@ -1874,24 +2190,382 @@ function PreviewDialog({ preview, onClose }) {
 
   return createPortal(
     <div className="dialog-backdrop preview-backdrop" role="presentation">
-      <section className="dialog preview-dialog" role="dialog" aria-modal="true" aria-labelledby="preview-title">
+      <section className={`dialog preview-dialog${isMaximized ? ' is-maximized' : ''}`} role="dialog" aria-modal="true" aria-labelledby="preview-title">
         <div className="preview-head">
           <div>
             <p className="eyebrow">preview</p>
             <h3 id="preview-title">{preview.title}</h3>
           </div>
-          <button className="icon-close" aria-label="关闭预览" title="关闭" onClick={onClose}>×</button>
+          <div className="preview-window-actions">
+            {canTogglePreviewMode && (
+              <button
+                className="window-icon-button"
+                type="button"
+                aria-label={nextPreviewMode === 'markdown' ? 'Markdown 渲染' : '源码预览'}
+                title={nextPreviewMode === 'markdown' ? 'Markdown 渲染' : '源码预览'}
+                onClick={() => setTextRenderMode(nextPreviewMode)}
+              >
+                {nextPreviewMode === 'markdown' ? <SquarePen size={17} strokeWidth={2.2} /> : <Code2 size={17} strokeWidth={2.2} />}
+              </button>
+            )}
+            <button
+              className="window-icon-button"
+              type="button"
+              aria-label={isMaximized ? '还原预览窗口' : '全屏预览窗口'}
+              title={isMaximized ? '还原' : '全屏'}
+              onClick={() => setIsMaximized((current) => !current)}
+            >
+              {isMaximized ? <Minimize2 size={17} strokeWidth={2.2} /> : <Maximize2 size={17} strokeWidth={2.2} />}
+            </button>
+            <button className="icon-close" aria-label="关闭预览" title="关闭" onClick={onClose}>×</button>
+          </div>
         </div>
-        {preview.type === 'text' && (
-          <div className="text-preview">
-            {preview.loading && <p className="muted">正在加载文本...</p>}
-            {typeof preview.text === 'string' && <pre>{preview.text}</pre>}
+        {(preview.type === 'text' || preview.type === 'markdown') && (
+          textRenderMode === 'markdown' ? (
+            <MarkdownPreview preview={{ ...preview, type: 'markdown' }} />
+          ) : (
+            <div className="text-preview">
+              {preview.loading && <p className="muted">正在加载文本...</p>}
+              {typeof preview.text === 'string' && <pre>{preview.text}</pre>}
+            </div>
+          )
+        )}
+        {preview.type === 'pdf' && (
+          <div className="pdf-preview">
+            <iframe src={preview.url} title={preview.title} />
+          </div>
+        )}
+        {preview.type === 'video' && (
+          <div className="video-preview">
+            <video src={preview.url} controls playsInline />
           </div>
         )}
       </section>
     </div>,
     document.body,
   );
+}
+
+function MarkdownPreview({ preview }) {
+  const bodyRef = useRef(null);
+  const [renderState, setRenderState] = useState({ loading: false, html: '', hasMermaid: false, error: '' });
+  const [enhanceError, setEnhanceError] = useState('');
+
+  useEffect(() => {
+    if (preview.loading) {
+      setRenderState({ loading: true, html: '', hasMermaid: false, error: '' });
+      setEnhanceError('');
+      return undefined;
+    }
+    if (typeof preview.text !== 'string') {
+      setRenderState({ loading: false, html: '', hasMermaid: false, error: '' });
+      setEnhanceError('');
+      return undefined;
+    }
+
+    let cancelled = false;
+    setRenderState((current) => ({ ...current, loading: true, error: '' }));
+    setEnhanceError('');
+    renderMarkdownHTML(preview.text, preview)
+      .then((result) => {
+        if (cancelled) return;
+        setRenderState({ loading: false, html: result.html, hasMermaid: result.hasMermaid, error: '' });
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setRenderState({ loading: false, html: '', hasMermaid: false, error: err.message || 'Markdown 渲染失败' });
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [preview.loading, preview.path, preview.target, preview.text]);
+
+  useEffect(() => {
+    const body = bodyRef.current;
+    if (!body || !renderState.html) return undefined;
+
+    let cancelled = false;
+    const copyTargets = new Map();
+    body.querySelectorAll('pre').forEach((pre, index) => {
+      const code = pre.querySelector('code');
+      const codeText = code?.textContent || pre.textContent || '';
+      if (pre.parentElement?.classList.contains('markdown-code-block')) {
+        const existingButton = pre.parentElement.querySelector('.markdown-code-copy');
+        if (existingButton) copyTargets.set(existingButton, codeText);
+        return;
+      }
+
+      const wrapper = document.createElement('div');
+      wrapper.className = 'markdown-code-block';
+
+      const button = document.createElement('button');
+      button.className = 'markdown-code-copy';
+      button.type = 'button';
+      button.setAttribute('aria-label', `复制代码块 ${index + 1}`);
+      setMarkdownCodeCopyIcon(button, 'copy');
+
+      copyTargets.set(button, codeText);
+      pre.parentNode.insertBefore(wrapper, pre);
+      wrapper.appendChild(button);
+      wrapper.appendChild(pre);
+    });
+
+    async function handleCodeCopy(event) {
+      const button = event.target.closest('.markdown-code-copy');
+      if (!button || !body.contains(button)) return;
+
+      const codeText = copyTargets.get(button);
+      if (typeof codeText !== 'string') return;
+
+      try {
+        await navigator.clipboard.writeText(codeText);
+        button.setAttribute('aria-label', '代码已复制');
+        setMarkdownCodeCopyIcon(button, 'check');
+        window.setTimeout(() => {
+          if (!cancelled && button.isConnected) {
+            button.setAttribute('aria-label', '复制代码块');
+            setMarkdownCodeCopyIcon(button, 'copy');
+          }
+        }, 1200);
+      } catch (err) {
+        if (!cancelled) setEnhanceError(`复制代码失败：${err.message || err}`);
+      }
+    }
+
+    body.addEventListener('click', handleCodeCopy);
+
+    import('highlight.js')
+      .then((module) => {
+        if (cancelled) return;
+        const hljs = module.default || module;
+        body.querySelectorAll('pre code').forEach((block) => {
+          if (block.classList.contains('language-mermaid')) return;
+          hljs.highlightElement(block);
+        });
+      })
+      .catch((err) => {
+        if (!cancelled) setEnhanceError(`代码高亮失败：${err.message || err}`);
+      });
+
+    if (renderState.hasMermaid) {
+      import('mermaid')
+        .then((module) => {
+          if (cancelled) return undefined;
+          const mermaid = module.default || module;
+          mermaid.initialize({ startOnLoad: false, theme: 'default', securityLevel: 'strict' });
+          return mermaid.run({ nodes: Array.from(body.querySelectorAll('.language-mermaid')) });
+        })
+        .catch((err) => {
+          if (!cancelled) setEnhanceError(`Mermaid 渲染失败：${err.message || err}`);
+        });
+    }
+
+    return () => {
+      cancelled = true;
+      body.removeEventListener('click', handleCodeCopy);
+    };
+  }, [renderState.hasMermaid, renderState.html]);
+
+  return (
+    <div className="markdown-preview">
+      {renderState.loading && <p className="muted">正在渲染 Markdown...</p>}
+      {renderState.error && <p className="muted">{renderState.error}</p>}
+      {enhanceError && <p className="muted">{enhanceError}</p>}
+      {renderState.html && <div ref={bodyRef} className="markdown-body" dangerouslySetInnerHTML={{ __html: renderState.html }} />}
+    </div>
+  );
+}
+
+function setMarkdownCodeCopyIcon(button, icon) {
+  button.innerHTML = icon === 'check'
+    ? '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg>'
+    : '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>';
+}
+
+async function renderMarkdownHTML(content, preview) {
+  const normalizedContent = normalizeMarkdownContent(content);
+  const hasMermaid = MERMAID_PATTERN.test(normalizedContent);
+  const hasMath = MATH_PATTERN.test(normalizedContent);
+  const [
+    { unified },
+    { default: remarkParse },
+    { default: remarkGfm },
+    { default: remarkRehype },
+    { default: rehypeRaw },
+    { default: rehypeSanitize, defaultSchema },
+    { default: rehypeStringify },
+  ] = await Promise.all([
+    import('unified'),
+    import('remark-parse'),
+    import('remark-gfm'),
+    import('remark-rehype'),
+    import('rehype-raw'),
+    import('rehype-sanitize'),
+    import('rehype-stringify'),
+  ]);
+  const markdownSanitizeSchema = {
+    ...defaultSchema,
+    attributes: {
+      ...defaultSchema.attributes,
+      code: [
+        ...(defaultSchema.attributes?.code || []),
+        ['className', /^language-[\w-]+$/, 'math-inline', 'math-display'],
+      ],
+    },
+  };
+  const processor = unified()
+    .use(remarkParse)
+    .use(remarkGfm);
+
+  if (hasMath) {
+    const { default: remarkMath } = await import('remark-math');
+    processor.use(remarkMath);
+  }
+
+  processor
+    .use(remarkRehype, { allowDangerousHtml: true })
+    .use(rehypeRaw)
+    .use(rehypeRewriteMarkdownAssets, {
+      target: preview.target,
+      path: preview.path,
+    })
+    .use(rehypeSanitize, markdownSanitizeSchema);
+
+  if (hasMath) {
+    const { default: rehypeKatex } = await import('rehype-katex');
+    processor.use(rehypeKatex);
+  }
+
+  processor.use(rehypeStringify);
+
+  const result = await processor.process(normalizedContent);
+  return { html: String(result), hasMermaid };
+}
+
+function normalizeMarkdownContent(content) {
+  return fenceLooseCodeBlocks(convertBoxTablesToHTML(String(content || '')));
+}
+
+function convertBoxTablesToHTML(content) {
+  const lines = content.split('\n');
+  const output = [];
+  for (let index = 0; index < lines.length;) {
+    if (!isBoxTableLine(lines[index])) {
+      output.push(lines[index]);
+      index += 1;
+      continue;
+    }
+
+    const block = [];
+    while (index < lines.length && isBoxTableLine(lines[index])) {
+      block.push(lines[index]);
+      index += 1;
+    }
+    output.push(renderBoxTableBlock(block));
+  }
+  return output.join('\n');
+}
+
+function isBoxTableLine(line) {
+  return /^[\s]*[┌┬┐├┼┤└┴┘│─].*[┌┬┐├┼┤└┴┘│─]?[\s]*$/.test(line || '');
+}
+
+function renderBoxTableBlock(lines) {
+  const rows = lines
+    .filter((line) => line.includes('│'))
+    .map((line) => line.split('│').slice(1, -1).map((cell) => cell.trim()))
+    .filter((row) => row.length > 0);
+  if (rows.length === 0) return lines.join('\n');
+
+  const [head, ...body] = rows;
+  const thead = `<thead><tr>${head.map((cell) => `<th>${escapeHTML(cell)}</th>`).join('')}</tr></thead>`;
+  const tbody = body.length > 0
+    ? `<tbody>${body.map((row) => `<tr>${row.map((cell) => `<td>${escapeHTML(cell)}</td>`).join('')}</tr>`).join('')}</tbody>`
+    : '';
+  return `<table>${thead}${tbody}</table>`;
+}
+
+function fenceLooseCodeBlocks(content) {
+  const lines = content.split('\n');
+  const output = [];
+  for (let index = 0; index < lines.length;) {
+    const originalBlock = [];
+    const block = [];
+    while (index < lines.length && isLooseCodeLine(lines[index])) {
+      originalBlock.push(lines[index]);
+      block.push(lines[index].replace(/^\s{1,4}/, ''));
+      index += 1;
+    }
+
+    if (block.length >= 2 && looksLikeCodeBlock(block)) {
+      output.push('```');
+      output.push(...block);
+      output.push('```');
+      continue;
+    }
+
+    output.push(...originalBlock);
+    if (block.length === 0) {
+      output.push(lines[index]);
+      index += 1;
+    }
+  }
+  return output.join('\n');
+}
+
+function isLooseCodeLine(line) {
+  return /^\s{1,4}\S/.test(line || '') && !/^\s{1,4}[-*+]\s+/.test(line || '');
+}
+
+function looksLikeCodeBlock(lines) {
+  const text = lines.join('\n');
+  return /(?:^|\n)(?:[\w.-]+\/|[\w.-]+\.(?:go|js|ts|tsx|jsx|yaml|yml|json|md)|type\s+\w+|func\s+\w+|\w+\([^)]*\)|#\s+\w|->)/.test(text);
+}
+
+function escapeHTML(value) {
+  return String(value)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+function rehypeRewriteMarkdownAssets(options) {
+  return (tree) => {
+    visitMarkdownNode(tree, (node) => {
+      if (node.type !== 'element' || node.tagName !== 'img' || !node.properties?.src) return;
+      node.properties.src = resolveMarkdownAssetURL(String(node.properties.src), options);
+    });
+  };
+}
+
+function visitMarkdownNode(node, visitor) {
+  visitor(node);
+  if (!Array.isArray(node.children)) return;
+  node.children.forEach((child) => visitMarkdownNode(child, visitor));
+}
+
+function resolveMarkdownAssetURL(rawURL, options) {
+  const value = String(rawURL || '').trim();
+  if (!value || !options?.target || !options?.path || isExternalMarkdownURL(value) || value.startsWith('#')) return rawURL;
+
+  const [pathPart, suffix = ''] = splitMarkdownURLSuffix(value);
+  const objectPath = pathPart.startsWith('/')
+    ? normalizeObjectPath(pathPart)
+    : resolveRelativeObjectPath(objectDirname(options.path), pathPart);
+  return `${adminStorageDownloadURL(options.target, objectPath)}${suffix}`;
+}
+
+function splitMarkdownURLSuffix(value) {
+  const match = value.match(/^([^?#]*)([?#].*)?$/);
+  if (!match) return [value, ''];
+  return [match[1], match[2] || ''];
+}
+
+function isExternalMarkdownURL(value) {
+  return /^(?:[a-z][a-z\d+.-]*:|\/\/)/i.test(value);
 }
 
 function targetOptions(draft) {
@@ -1943,6 +2617,21 @@ function serviceName(target, s3, webdav, sftp) {
     return sftp?.name || sftp?.host || `SFTP ${index + 1}`;
   }
   return target;
+}
+
+function cloneServiceName(name, draft) {
+  const existingNames = new Set(['local']);
+  [...(draft.s3 || []), ...(draft.webdav || []), ...(draft.sftp || [])].forEach((item) => {
+    const itemName = String(item.name || '').trim();
+    if (itemName) existingNames.add(itemName);
+  });
+  const baseName = String(name || '文件服务').trim() || '文件服务';
+  const clonedName = `${baseName}克隆`;
+  if (!existingNames.has(clonedName)) return clonedName;
+  for (let index = 2; ; index += 1) {
+    const candidate = `${clonedName}${index}`;
+    if (!existingNames.has(candidate)) return candidate;
+  }
 }
 
 function effectiveDefaultTarget(draft) {
@@ -2044,12 +2733,101 @@ function isImage(item) {
   return Boolean(item?.url) && /\.(avif|bmp|gif|ico|jpe?g|png|svg|webp)$/i.test(item.path || '');
 }
 
+function isMarkdownFile(item) {
+  return /\.(md|markdown)$/i.test(objectName(item));
+}
+
+function shouldRenderAsMarkdown(item, text) {
+  return isMarkdownFile(item) || FENCED_CODE_PATTERN.test(text) || MARKDOWN_TABLE_PATTERN.test(text);
+}
+
 function isTextFile(item) {
-  return Boolean(item?.url) && /\.(conf|css|csv|env|go|htm|html|ini|js|json|jsx|log|md|py|rs|sh|sql|toml|ts|tsx|txt|xml|ya?ml)$/i.test(item.path || '');
+  return !item?.isDir && /\.(conf|css|csv|env|go|htm|html|ini|js|json|jsx|log|markdown|md|py|rs|sh|sql|toml|ts|tsx|txt|xml|ya?ml)$/i.test(objectName(item));
+}
+
+function editorLanguageForPath(value) {
+  const name = String(value || '').toLowerCase();
+  if (/\.(md|markdown)$/.test(name)) return 'markdown';
+  if (/\.go$/.test(name)) return 'go';
+  if (/\.(js|jsx)$/.test(name)) return 'javascript';
+  if (/\.(ts|tsx)$/.test(name)) return 'typescript';
+  if (/\.json$/.test(name)) return 'json';
+  if (/\.css$/.test(name)) return 'css';
+  if (/\.html?$/.test(name)) return 'html';
+  if (/\.ya?ml$/.test(name)) return 'yaml';
+  if (/\.xml$/.test(name)) return 'xml';
+  if (/\.sql$/.test(name)) return 'sql';
+  if (/\.py$/.test(name)) return 'python';
+  if (/\.rs$/.test(name)) return 'rust';
+  if (/\.sh$/.test(name)) return 'shell';
+  if (/\.toml$/.test(name)) return 'toml';
+  if (/\.ini$/.test(name)) return 'ini';
+  return 'plaintext';
+}
+
+function isPDFFile(item) {
+  return /\.pdf$/i.test(item?.path || '');
+}
+
+function isOfficeFile(item) {
+  return /\.(docx?|xlsx?|pptx?)$/i.test(item?.path || '');
+}
+
+function isVideoFile(item) {
+  return /\.(m4v|mov|mp4|ogg|ogv|webm)$/i.test(item?.path || '');
+}
+
+function microsoftOfficeViewerURL(fileURL) {
+  return `https://view.officeapps.live.com/op/view.aspx?src=${encodeURIComponent(fileURL)}`;
+}
+
+function isHTTPURL(value) {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+function isPrivateNetworkURL(value) {
+  try {
+    const hostname = new URL(value).hostname.toLowerCase();
+    if (hostname === 'localhost' || hostname.endsWith('.localhost')) return true;
+    if (hostname === '::1' || hostname === '[::1]' || hostname.startsWith('127.')) return true;
+    if (hostname.startsWith('10.') || hostname.startsWith('192.168.')) return true;
+    const match = hostname.match(/^172\.(\d+)\./);
+    return Boolean(match && Number(match[1]) >= 16 && Number(match[1]) <= 31);
+  } catch {
+    return false;
+  }
+}
+
+function isPublicHTTPURL(value) {
+  return isHTTPURL(value) && !isPrivateNetworkURL(value);
+}
+
+function hasConfiguredURLPrefix(config, selectedTarget) {
+  return targetURLPrefix(config, selectedTarget).trim() !== '';
+}
+
+function targetURLPrefix(config, selectedTarget) {
+  if (!config) return '';
+  if (selectedTarget === 'local') return String(config.urlPrefix || '');
+  const target = parseIndexedTarget(selectedTarget);
+  if (!target) return '';
+  if (target.type === 's3') return String(config.s3?.[target.index]?.urlPrefix || '');
+  if (target.type === 'webdav') return String(config.webdav?.[target.index]?.urlPrefix || '');
+  if (target.type === 'sftp') return String(config.sftp?.[target.index]?.urlPrefix || '');
+  return '';
 }
 
 function isArchiveFile(item) {
   return /\.(zip|tar|tar\.gz|tgz|tar\.bz2|tbz2|tar\.xz|txz|gz|bz2|xz)$/i.test(item?.path || '');
+}
+
+function objectName(item) {
+  return String(item?.path || item?.displayName || item?.name || '');
 }
 
 function triggerDownload(url, fileName) {
@@ -2066,6 +2844,25 @@ function joinObjectPath(dir, name) {
   const cleanDir = String(dir || '').replace(/^\/+|\/+$/g, '');
   const cleanName = String(name || '').replace(/^\/+|\/+$/g, '');
   return cleanDir ? `${cleanDir}/${cleanName}` : cleanName;
+}
+
+function objectDirname(path) {
+  const parts = normalizeObjectPath(path).split('/').filter(Boolean);
+  parts.pop();
+  return parts.join('/');
+}
+
+function resolveRelativeObjectPath(basePath, relativePath) {
+  const stack = normalizeObjectPath(basePath).split('/').filter(Boolean);
+  String(relativePath || '').replace(/\\/g, '/').split('/').forEach((part) => {
+    if (!part || part === '.') return;
+    if (part === '..') {
+      stack.pop();
+      return;
+    }
+    stack.push(part);
+  });
+  return stack.join('/');
 }
 
 function normalizeObjectPath(value) {

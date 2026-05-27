@@ -408,7 +408,7 @@ curl -X DELETE "http://127.0.0.1:17788/delete/demo.png?key=secret"
 
 ## Docker
 
-Docker 镜像使用仓库内的 Linux amd64 发布包构建。
+Docker 构建脚本会在当前目录查找 `upimg-linux-${ARCH}.tar.gz` 发布包，`ARCH` 支持 `amd64` 或 `arm64`，未设置时由脚本按当前机器架构推断。当前目录没有发布包时，脚本会询问是否从 `https://github.com/cgistar/upimg` 下载最新版，并按选中的发布包重新生成 `Dockerfile` 和 `docker-compose.yml`。
 ```bash
 ./build_docker.sh
 ```
