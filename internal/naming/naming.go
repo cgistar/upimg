@@ -90,6 +90,34 @@ func SafeRelative(value string) (string, error) {
 	return cleaned, nil
 }
 
+func SafeRemotePath(value string) (string, error) {
+	trimmed := strings.TrimSpace(strings.ReplaceAll(value, "\\", "/"))
+	if trimmed == "" {
+		return "", fmt.Errorf("path is empty")
+	}
+	for _, part := range strings.Split(trimmed, "/") {
+		if part == ".." {
+			return "", fmt.Errorf("path contains unsafe component")
+		}
+	}
+	absolute := strings.HasPrefix(trimmed, "/")
+	trimmed = strings.Trim(trimmed, "/")
+	if trimmed == "" {
+		if absolute {
+			return "/", nil
+		}
+		return "", fmt.Errorf("path is empty")
+	}
+	cleaned, err := SafeRelative(trimmed)
+	if err != nil {
+		return "", err
+	}
+	if absolute {
+		return "/" + cleaned, nil
+	}
+	return cleaned, nil
+}
+
 func shortHash(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])[:16]

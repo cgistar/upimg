@@ -120,6 +120,42 @@ func (w *WebDAV) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
+func (w *WebDAV) Rename(ctx context.Context, sourceKey, destinationKey string) error {
+	sourceKey, err := naming.SafeRelative(sourceKey)
+	if err != nil {
+		return err
+	}
+	destinationKey, err = naming.SafeRelative(destinationKey)
+	if err != nil {
+		return err
+	}
+	isDir, err := w.isCollection(ctx, sourceKey)
+	if err != nil {
+		return err
+	}
+	if isDir {
+		return fmt.Errorf("target is not a file")
+	}
+	req, err := w.newRequest(ctx, "MOVE", w.remoteObjectPath(sourceKey), false, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Destination", w.remoteURL(w.remoteObjectPath(destinationKey), false))
+	req.Header.Set("Overwrite", "F")
+	resp, err := w.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusPreconditionFailed {
+		return fmt.Errorf("destination already exists")
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("webdav move failed: %s", resp.Status)
+	}
+	return nil
+}
+
 func (w *WebDAV) CreateDir(ctx context.Context, key string) error {
 	key, err := normalizeDirectoryKey(key)
 	if err != nil {
@@ -200,6 +236,34 @@ func (w *WebDAV) FileURL(key, _ string) string {
 		return strings.TrimRight(prefix, "/") + "/" + objectPath
 	}
 	return w.remoteURL(objectPath, false)
+}
+
+func (w *WebDAV) isCollection(ctx context.Context, key string) (bool, error) {
+	req, err := w.newRequest(ctx, "PROPFIND", w.remoteObjectPath(key), false, nil)
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("Depth", "0")
+	resp, err := w.client.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return false, fmt.Errorf("file not found")
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return false, fmt.Errorf("webdav propfind failed: %s", resp.Status)
+	}
+	var multi davMultiStatus
+	if err := xml.NewDecoder(resp.Body).Decode(&multi); err != nil {
+		return false, err
+	}
+	for _, response := range multi.Responses {
+		prop := response.successProp()
+		return prop.ResourceType.Collection, nil
+	}
+	return false, fmt.Errorf("file not found")
 }
 
 func (w *WebDAV) List(ctx context.Context, _ string, dir string) ([]Object, error) {

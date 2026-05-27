@@ -7,6 +7,10 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.32.3
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.3
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.93.1
+	github.com/aws/smithy-go v1.24.0
+	github.com/coder/websocket v1.8.14
+	github.com/pkg/sftp v1.13.10
+	golang.org/x/crypto v0.52.0
 )
 
 require (
@@ -24,5 +28,6 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sso v1.30.6 // indirect
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.35.11 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.41.3 // indirect
-	github.com/aws/smithy-go v1.24.0 // indirect
+	github.com/kr/fs v0.1.0 // indirect
+	golang.org/x/sys v0.45.0 // indirect
 )

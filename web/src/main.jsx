@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { createRoot } from 'react-dom/client';
+import { ArchiveRestore, Check, ChevronDown, Eraser, FilePenLine, FolderOpen, Link2, LogOut, Maximize2, Minimize2, OctagonX, Settings, SquarePen, Terminal, X } from 'lucide-react';
 import './styles.css';
 
 const emptyConfig = {
@@ -14,6 +15,7 @@ const emptyConfig = {
   defaultTarget: '',
   s3: [],
   webdav: [],
+  sftp: [],
 };
 
 const emptyS3 = {
@@ -37,6 +39,42 @@ const emptyWebDAV = {
   uploadPath: '',
 };
 
+const emptySFTP = {
+  name: '',
+  host: '',
+  port: 22,
+  username: '',
+  password: '',
+  privateKey: '',
+  passphrase: '',
+  hostKeyFingerprint: '',
+  rootPath: '',
+  urlPrefix: '',
+  uploadPath: '',
+};
+
+const fieldLabels = {
+  key: '访问密钥',
+  rename: '命名规则',
+  host: '主机',
+  port: '端口',
+  basePath: '访问前缀',
+  filePath: '本地目录',
+  urlPrefix: 'URL 链接',
+  name: '配置名称',
+  bucket: '存储桶',
+  region: '区域',
+  accessKeyID: 'Access Key ID',
+  secretAccessKey: 'Secret Access Key',
+  endpoint: '服务地址',
+  uploadPath: '上传目录',
+  username: '用户名',
+  password: '密码',
+  rootPath: '远程根目录',
+  privateKey: '私钥内容',
+  passphrase: '私钥口令',
+};
+
 async function api(path, options = {}) {
   const headers = options.body instanceof FormData ? {} : { 'Content-Type': 'application/json' };
   const response = await fetch(`${adminAPIBase()}${path}`, {
@@ -46,7 +84,9 @@ async function api(path, options = {}) {
   });
   const data = await response.json().catch(() => ({ success: false, message: 'invalid server response' }));
   if (!response.ok || data.success === false) {
-    throw new Error(data.message || `request failed: ${response.status}`);
+    const err = new Error(data.message || `request failed: ${response.status}`);
+    err.data = data;
+    throw err;
   }
   return data;
 }
@@ -102,6 +142,17 @@ function adminAPIBase() {
   return `${adminBasePath()}/api/admin`;
 }
 
+function adminStorageDownloadURL(target, objectPath) {
+  const params = new URLSearchParams({ target, path: objectPath });
+  return `${adminAPIBase()}/storage/download?${params}`;
+}
+
+function adminSFTPTerminalURL(target) {
+  const params = new URLSearchParams({ target });
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${protocol}//${window.location.host}${adminAPIBase()}/sftp/terminal?${params}`;
+}
+
 function adminBasePath() {
   const injected = window.__UPIMG_ADMIN__?.basePath;
   if (typeof injected === 'string') return normalizeBasePath(injected);
@@ -125,9 +176,11 @@ function App() {
   const [objects, setObjects] = useState([]);
   const [view, setView] = useState('files');
   const [message, setMessage] = useState('');
+  const [warning, setWarning] = useState('');
   const [error, setError] = useState('');
   const [confirmState, setConfirmState] = useState(null);
   const [deleting, setDeleting] = useState(null);
+  const [extracting, setExtracting] = useState(null);
   const [uploadDialog, setUploadDialog] = useState(null);
   const [virtualFolders, setVirtualFolders] = useState([]);
   const [busy, setBusy] = useState(false);
@@ -142,7 +195,7 @@ function App() {
 
   useEffect(() => {
     if (!authenticated) return;
-    loadConfig();
+    loadConfig().catch((err) => setError(err.message));
   }, [authenticated]);
 
   useEffect(() => {
@@ -155,6 +208,12 @@ function App() {
     const timer = window.setTimeout(() => setMessage(''), 2600);
     return () => window.clearTimeout(timer);
   }, [message]);
+
+  useEffect(() => {
+    if (!warning) return undefined;
+    const timer = window.setTimeout(() => setWarning(''), 3600);
+    return () => window.clearTimeout(timer);
+  }, [warning]);
 
   useEffect(() => {
     if (!error) return undefined;
@@ -211,9 +270,14 @@ function App() {
   }
 
   async function logout() {
-    await api('/logout', { method: 'POST', body: '{}' });
-    setSession({ authenticated: false });
-    setConfigState(null);
+    try {
+      await api('/logout', { method: 'POST', body: '{}' });
+      setSession({ authenticated: false });
+      setConfigState(null);
+      setError('');
+    } catch (err) {
+      setError(err.message);
+    }
   }
 
   async function uploadFiles(files, target, uploadPath) {
@@ -264,14 +328,16 @@ function App() {
     });
   }
 
+  const statusToast = (message || warning || error) ? <Toast type={error ? 'bad' : warning ? 'warn' : 'ok'} message={error || warning || message} /> : null;
+
   if (!session) {
-    return <Shell message="正在连接服务..." />;
+    return <><Shell message="正在连接服务..." />{statusToast}</>;
   }
   if (!authenticated) {
-    return <Login onLogin={login} error={error} />;
+    return <><Login onLogin={login} />{statusToast}</>;
   }
   if (!configState) {
-    return <Shell message="正在加载配置..." />;
+    return <><Shell message="正在加载配置..." />{statusToast}</>;
   }
 
   return (
@@ -292,14 +358,21 @@ function App() {
               </select>
             </label>
           )}
-          <button className="ghost" onClick={() => setView(view === 'config' ? 'files' : 'config')}>
-            {view === 'config' ? '返回文件' : '配置'}
+          <button
+            className="icon-button"
+            aria-label={view === 'config' ? '返回文件' : '配置'}
+            title={view === 'config' ? '返回文件' : '配置'}
+            onClick={() => setView(view === 'config' ? 'files' : 'config')}
+          >
+            {view === 'config' ? <FolderOpen size={18} strokeWidth={2.2} /> : <Settings size={18} strokeWidth={2.2} />}
           </button>
-          <button className="ghost" onClick={logout}>退出</button>
+          <button className="icon-button" aria-label="退出" title="退出" onClick={logout}>
+            <LogOut size={18} strokeWidth={2.2} />
+          </button>
         </div>
       </header>
 
-      {(message || error) && <Toast type={error ? 'bad' : 'ok'} message={error || message} />}
+      {statusToast}
       {confirmState && (
         <ConfirmDialog
           title={confirmState.title}
@@ -318,6 +391,7 @@ function App() {
         />
       )}
       {deleting && <DeleteOverlay message={deleting.message} />}
+      {extracting && <ExtractOverlay item={extracting.item} path={path} />}
       {uploadDialog && (
         <UploadDialog
           upload={uploadDialog}
@@ -373,6 +447,34 @@ function App() {
               setDeleting(null);
             }
           }}
+          onRename={async (sourcePath, name) => {
+            const params = new URLSearchParams({ target: selectedTarget });
+            try {
+              await api(`/storage/object/rename?${params}`, { method: 'PUT', body: JSON.stringify({ path: sourcePath, name }) });
+            } catch (err) {
+              if (!err.data?.partial) throw err;
+              setWarning(err.message);
+              await loadObjects(selectedTarget, path);
+              return;
+            }
+            setMessage('文件名已更新');
+            await loadObjects(selectedTarget, path);
+          }}
+          onExtract={async (item) => {
+            const params = new URLSearchParams({ target: selectedTarget });
+            setExtracting({ item });
+            try {
+              await api(`/storage/object/extract?${params}`, {
+                method: 'POST',
+                body: JSON.stringify({ path: item.path, overwrite: true }),
+              });
+              setMessage('解压完成');
+            } finally {
+              await loadObjects(selectedTarget, path);
+              setExtracting(null);
+            }
+          }}
+          onMessage={setMessage}
           onError={setError}
           onConfirm={setConfirmState}
         />
@@ -392,6 +494,8 @@ function App() {
             }
             setMessage('配置已保存并热更新；host/port 如有变更需重启服务。');
           }}
+          onMessage={setMessage}
+          onWarn={setWarning}
           onError={setError}
         />
       )}
@@ -403,7 +507,7 @@ function Shell({ message }) {
   return <main className="center-card"><p>{message}</p></main>;
 }
 
-function Login({ onLogin, error }) {
+function Login({ onLogin }) {
   const [key, setKey] = useState('');
   return (
     <main className="login-page">
@@ -414,7 +518,6 @@ function Login({ onLogin, error }) {
         <h1>登录</h1>
         <input autoFocus type="password" value={key} onChange={(event) => setKey(event.target.value)} placeholder="请输入密码" />
         <button type="submit">登录</button>
-        {error && <div className="notice bad">{error}</div>}
       </form>
     </main>
   );
@@ -428,14 +531,17 @@ function Toast({ type, message }) {
   );
 }
 
-function FilePanel({ selectedTarget, path, setPath, objects, busy, onRefresh, onCreateFolder, onUpload, onBatchDelete, onError, onConfirm }) {
+function FilePanel({ selectedTarget, path, setPath, objects, busy, onRefresh, onCreateFolder, onUpload, onBatchDelete, onRename, onExtract, onMessage, onError, onConfirm }) {
   const [browserMode, setBrowserMode] = useState('list');
   const [preview, setPreview] = useState(null);
   const [folderDialog, setFolderDialog] = useState(false);
   const [dragActive, setDragActive] = useState(false);
   const [pathInput, setPathInput] = useState(path);
   const [pathHistory, setPathHistory] = useState([]);
+  const [pathHistoryOpen, setPathHistoryOpen] = useState(false);
   const [selectedPaths, setSelectedPaths] = useState([]);
+  const [renameState, setRenameState] = useState(null);
+  const [commandDialog, setCommandDialog] = useState(false);
   const crumbs = path ? path.split('/').filter(Boolean) : [];
   const parentPath = crumbs.slice(0, -1).join('/');
   const entries = [
@@ -447,13 +553,17 @@ function FilePanel({ selectedTarget, path, setPath, objects, busy, onRefresh, on
   const selectedSet = new Set(selectedPaths);
   const allSelected = selectableEntries.length > 0 && selectableEntries.every((item) => selectedSet.has(item.path));
   const selectedItems = selectableEntries.filter((item) => selectedSet.has(item.path));
+  const selectedDownloadableItems = selectedItems.filter((item) => !item.isDir && !item.virtual);
+  const isSFTPTarget = selectedTarget.startsWith('sftp:');
 
   useEffect(() => {
     setSelectedPaths([]);
+    setRenameState(null);
   }, [selectedTarget, path, objects]);
 
   useEffect(() => {
     setPathInput(path);
+    setPathHistoryOpen(false);
   }, [path]);
 
   function changePath(nextPath) {
@@ -465,6 +575,129 @@ function FilePanel({ selectedTarget, path, setPath, objects, busy, onRefresh, on
 
   function commitPathInput() {
     changePath(pathInput);
+  }
+
+  function selectPathHistory(event, historyPath) {
+    event.preventDefault();
+    setPathInput(historyPath);
+    setPathHistoryOpen(false);
+    changePath(historyPath);
+  }
+
+  function canRename(item) {
+    return !item.special && !item.isDir;
+  }
+
+  function canCopyURL(item) {
+    return !item.special && Boolean(item.url);
+  }
+
+  function canExtract(item) {
+    return selectedTarget.startsWith('sftp:') && !item.special && !item.isDir && isArchiveFile(item);
+  }
+
+  function beginRename(event, item) {
+    event.stopPropagation();
+    if (!canRename(item)) return;
+    setRenameState({ path: item.path, name: item.displayName, saving: false });
+  }
+
+  function confirmExtract(event, item) {
+    event.stopPropagation();
+    if (!canExtract(item)) return;
+    onConfirm({
+      title: '解压缩',
+      message: `确认在当前目录解压缩 ${item.displayName}？同名文件将被覆盖。`,
+      confirmText: '解压缩',
+      action: () => onExtract(item),
+    });
+  }
+
+  function cancelRename(event) {
+    event?.stopPropagation();
+    setRenameState(null);
+  }
+
+  async function copyURL(event, item) {
+    event.stopPropagation();
+    if (!canCopyURL(item)) return;
+    try {
+      await navigator.clipboard.writeText(item.url);
+      onMessage('URL 已复制');
+    } catch (err) {
+      onError(`复制失败：${err.message}`);
+    }
+  }
+
+  async function submitRename(event) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!renameState || renameState.saving) return;
+    const nextName = renameState.name.trim();
+    const errorMessage = validateFileName(nextName);
+    if (errorMessage) {
+      onError(errorMessage);
+      return;
+    }
+    setRenameState((current) => (current ? { ...current, saving: true } : current));
+    try {
+      await onRename(renameState.path, nextName);
+      setRenameState(null);
+    } catch (err) {
+      setRenameState((current) => (current ? { ...current, saving: false } : current));
+      onError(err.message);
+    }
+  }
+
+  function renderEntryName(item, mode) {
+    const editing = renameState?.path === item.path;
+    if (editing) {
+      return (
+        <form className={`rename-form ${mode}`} onSubmit={submitRename} onClick={(event) => event.stopPropagation()}>
+          <input
+            autoFocus
+            value={renameState.name}
+            disabled={renameState.saving}
+            onChange={(event) => setRenameState((current) => (current ? { ...current, name: event.target.value } : current))}
+            onKeyDown={(event) => {
+              if (event.key === 'Escape') cancelRename(event);
+            }}
+          />
+          <button className="tiny-icon" type="submit" disabled={renameState.saving} aria-label="保存文件名" title="保存文件名">
+            <Check size={12} strokeWidth={2.4} />
+          </button>
+          <button className="tiny-icon" type="button" disabled={renameState.saving} onClick={cancelRename} aria-label="取消重命名" title="取消重命名">
+            <X size={12} strokeWidth={2.4} />
+          </button>
+        </form>
+      );
+    }
+    return (
+      <>
+        <button className={mode === 'thumb' ? 'thumb-name' : 'name-button'} onClick={() => openEntry(item)}>
+          <span>{item.displayName}</span>
+        </button>
+        {(canRename(item) || canCopyURL(item) || canExtract(item)) && (
+          <span className="file-inline-actions">
+            {canRename(item) && (
+              <button className="tiny-icon" type="button" onClick={(event) => beginRename(event, item)} aria-label="重命名文件" title="重命名文件">
+                <FilePenLine size={11} strokeWidth={2.3} />
+              </button>
+            )}
+            {canCopyURL(item) && (
+              <button className="tiny-icon" type="button" onClick={(event) => copyURL(event, item)} aria-label="复制 URL" title="复制 URL">
+                <Link2 size={11} strokeWidth={2.3} />
+              </button>
+            )}
+            {canExtract(item) && (
+              <button className="tiny-icon" type="button" onClick={(event) => confirmExtract(event, item)} aria-label="解压缩到当前目录" title="解压缩到当前目录">
+                <ArchiveRestore size={11} strokeWidth={2.3} />
+              </button>
+            )}
+          </span>
+        )}
+      </>
+    );
   }
 
   async function openEntry(item) {
@@ -490,7 +723,8 @@ function FilePanel({ selectedTarget, path, setPath, objects, busy, onRefresh, on
         const text = await response.text();
         setPreview({ type: 'text', title: item.displayName, text });
       } catch (err) {
-        setPreview({ type: 'text', title: item.displayName, error: err.message });
+        setPreview(null);
+        onError(`预览失败：${err.message}`);
       }
       return;
     }
@@ -515,6 +749,17 @@ function FilePanel({ selectedTarget, path, setPath, objects, busy, onRefresh, on
       confirmText: '删除',
       action: () => onBatchDelete(selectedItems),
     });
+  }
+
+  function downloadSelected() {
+    if (selectedDownloadableItems.length === 0) return;
+    for (const item of selectedDownloadableItems) {
+      triggerDownload(adminStorageDownloadURL(selectedTarget, item.path), basename(item.path));
+    }
+    const skipped = selectedItems.length - selectedDownloadableItems.length;
+    onMessage(skipped > 0
+      ? `开始下载 ${selectedDownloadableItems.length} 个文件，已跳过 ${skipped} 个目录`
+      : `开始下载 ${selectedDownloadableItems.length} 个文件`);
   }
 
   function handleDragEnter(event) {
@@ -577,12 +822,18 @@ function FilePanel({ selectedTarget, path, setPath, objects, busy, onRefresh, on
             </label>
             <button className="ghost" onClick={() => setFolderDialog(true)}>新建文件夹</button>
             <button className="ghost" onClick={onRefresh}>{busy ? '刷新中...' : '刷新'}</button>
+            <button className="ghost" disabled={selectedDownloadableItems.length === 0} onClick={downloadSelected}>下载</button>
             <button className="danger" disabled={selectedItems.length === 0} onClick={confirmBatchDelete}>删除</button>
+            {isSFTPTarget && (
+              <button className="ghost" onClick={() => setCommandDialog(true)}>
+                <Terminal size={15} strokeWidth={2.2} />
+                执行
+              </button>
+            )}
           </div>
           <div className="nas-target">
-            <label className="path-jump">
+            <div className="path-jump">
               <input
-                list="path-history"
                 value={pathInput}
                 onChange={(event) => setPathInput(event.target.value)}
                 onBlur={commitPathInput}
@@ -594,12 +845,35 @@ function FilePanel({ selectedTarget, path, setPath, objects, busy, onRefresh, on
                 }}
                 placeholder="/ 或 path/to"
               />
-              <datalist id="path-history">
-                {pathHistory.map((item) => (
-                  <option key={item || '/'} value={item} label={item || '/'} />
-                ))}
-              </datalist>
-            </label>
+              <button
+                className={pathHistoryOpen ? 'path-history-toggle active' : 'path-history-toggle'}
+                type="button"
+                aria-label="显示历史路径"
+                aria-expanded={pathHistoryOpen}
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => setPathHistoryOpen((open) => !open)}
+              >
+                <ChevronDown size={15} strokeWidth={2.2} />
+              </button>
+              {pathHistoryOpen && (
+                <div className="path-history-menu" role="listbox" aria-label="历史路径">
+                  {pathHistory.length === 0 ? (
+                    <div className="path-history-empty">暂无历史路径</div>
+                  ) : (
+                    pathHistory.map((item) => (
+                      <button
+                        key={item || '/'}
+                        type="button"
+                        role="option"
+                        onMouseDown={(event) => selectPathHistory(event, item)}
+                      >
+                        {item || '/'}
+                      </button>
+                    ))
+                  )}
+                </div>
+              )}
+            </div>
           </div>
         </div>
 
@@ -633,9 +907,9 @@ function FilePanel({ selectedTarget, path, setPath, objects, busy, onRefresh, on
                     onClick={(event) => event.stopPropagation()}
                   />
                 </span>
-                <button className="file-cell name" role="cell" onClick={() => openEntry(item)}>
-                  <span>{item.displayName}</span>
-                </button>
+                <div className="file-cell name-cell" role="cell">
+                  {renderEntryName(item, 'list')}
+                </div>
                 <span className="file-cell size" role="cell">{item.isDir ? '-' : formatSize(item.size)}</span>
                 <span className="file-cell time" role="cell">{item.modTime ? formatDateTime(item.modTime) : '-'}</span>
               </div>
@@ -657,7 +931,9 @@ function FilePanel({ selectedTarget, path, setPath, objects, busy, onRefresh, on
                   {isImage(item) ? <img src={item.url} alt={item.displayName} loading="lazy" /> : <span>{item.isDir ? 'DIR' : fileExt(item.displayName)}</span>}
                 </button>
                 <div className="thumb-meta">
-                  <button className="thumb-name" onClick={() => openEntry(item)}>{item.displayName}</button>
+                  <div className="thumb-name-row">
+                    {renderEntryName(item, 'thumb')}
+                  </div>
                   <span>{item.isDir ? '-' : formatSize(item.size)}</span>
                   <span>{item.modTime ? formatDateTime(item.modTime) : '-'}</span>
                 </div>
@@ -677,6 +953,7 @@ function FilePanel({ selectedTarget, path, setPath, objects, busy, onRefresh, on
       {folderDialog && (
         <FolderDialog
           path={path}
+          onError={onError}
           onCancel={() => setFolderDialog(false)}
           onCreate={async (name) => {
             await onCreateFolder(joinObjectPath(path, name));
@@ -685,11 +962,20 @@ function FilePanel({ selectedTarget, path, setPath, objects, busy, onRefresh, on
         />
       )}
       {preview && <PreviewDialog preview={preview} onClose={() => setPreview(null)} />}
+      {commandDialog && (
+        <CommandDialog
+          target={selectedTarget}
+          path={path}
+          onClose={() => setCommandDialog(false)}
+          onError={onError}
+          onMessage={onMessage}
+        />
+      )}
     </section>
   );
 }
 
-function ConfigPanel({ configState, selectedTarget, setSelectedTarget, onSaved, onError }) {
+function ConfigPanel({ configState, selectedTarget, setSelectedTarget, onSaved, onMessage, onWarn, onError }) {
   const [draft, setDraft] = useState(configState.config);
   const [serviceDialog, setServiceDialog] = useState(null);
 
@@ -697,9 +983,11 @@ function ConfigPanel({ configState, selectedTarget, setSelectedTarget, onSaved, 
 
   const s3Index = selectedTarget.startsWith('s3:') ? Number(selectedTarget.slice(3)) : -1;
   const webdavIndex = selectedTarget.startsWith('webdav:') ? Number(selectedTarget.slice(7)) : -1;
+  const sftpIndex = selectedTarget.startsWith('sftp:') ? Number(selectedTarget.slice(5)) : -1;
   const selectedS3 = s3Index >= 0 ? draft.s3?.[s3Index] : null;
   const selectedWebDAV = webdavIndex >= 0 ? draft.webdav?.[webdavIndex] : null;
-  const selectedServiceName = serviceName(selectedTarget, selectedS3, selectedWebDAV);
+  const selectedSFTP = sftpIndex >= 0 ? draft.sftp?.[sftpIndex] : null;
+  const selectedServiceName = serviceName(selectedTarget, selectedS3, selectedWebDAV, selectedSFTP);
   const currentDefaultTarget = effectiveDefaultTarget(draft);
 
   function update(field, value) {
@@ -739,15 +1027,20 @@ function ConfigPanel({ configState, selectedTarget, setSelectedTarget, onSaved, 
         ...draft,
         webdav: (draft.webdav || []).map((item, itemIndex) => (itemIndex === webdavIndex ? { ...values } : item)),
       };
+    } else if (selectedTarget.startsWith('sftp:')) {
+      nextDraft = {
+        ...draft,
+        sftp: (draft.sftp || []).map((item, itemIndex) => (itemIndex === sftpIndex ? { ...values } : item)),
+      };
     }
-    await persistConfig(syncDefaultTarget(nextDraft, selectedTarget));
+    await persistConfig(syncDefaultTarget(nextDraft, effectiveDefaultTarget(draft)));
     setServiceDialog(null);
   }
 
   async function createS3(values) {
     const nextS3 = [...(draft.s3 || []), { ...values }];
     const createdIndex = nextS3.length - 1;
-    const nextDraft = syncDefaultTarget({ ...draft, s3: nextS3 }, `s3:${createdIndex}`);
+    const nextDraft = syncDefaultTarget({ ...draft, s3: nextS3 }, effectiveDefaultTarget(draft));
     await persistConfig(nextDraft);
     setSelectedTarget(`s3:${createdIndex}`);
     setServiceDialog(null);
@@ -756,20 +1049,62 @@ function ConfigPanel({ configState, selectedTarget, setSelectedTarget, onSaved, 
   async function createWebDAV(values) {
     const nextWebDAV = [...(draft.webdav || []), { ...values }];
     const createdIndex = nextWebDAV.length - 1;
-    const nextDraft = syncDefaultTarget({ ...draft, webdav: nextWebDAV }, `webdav:${createdIndex}`);
+    const nextDraft = syncDefaultTarget({ ...draft, webdav: nextWebDAV }, effectiveDefaultTarget(draft));
     await persistConfig(nextDraft);
     setSelectedTarget(`webdav:${createdIndex}`);
     setServiceDialog(null);
   }
 
+  async function createSFTP(values) {
+    const nextSFTP = [...(draft.sftp || []), { ...values }];
+    const createdIndex = nextSFTP.length - 1;
+    const nextDraft = syncDefaultTarget({ ...draft, sftp: nextSFTP }, effectiveDefaultTarget(draft));
+    await persistConfig(nextDraft);
+    setSelectedTarget(`sftp:${createdIndex}`);
+    setServiceDialog(null);
+  }
+
   async function deleteService() {
     if (selectedTarget === 'local') return;
-    const nextDraft = selectedTarget.startsWith('s3:')
-      ? { ...draft, s3: (draft.s3 || []).filter((_, itemIndex) => itemIndex !== s3Index) }
-      : { ...draft, webdav: (draft.webdav || []).filter((_, itemIndex) => itemIndex !== webdavIndex) };
+    let nextDraft = draft;
+    if (selectedTarget.startsWith('s3:')) {
+      nextDraft = { ...draft, s3: (draft.s3 || []).filter((_, itemIndex) => itemIndex !== s3Index) };
+    } else if (selectedTarget.startsWith('webdav:')) {
+      nextDraft = { ...draft, webdav: (draft.webdav || []).filter((_, itemIndex) => itemIndex !== webdavIndex) };
+    } else if (selectedTarget.startsWith('sftp:')) {
+      nextDraft = { ...draft, sftp: (draft.sftp || []).filter((_, itemIndex) => itemIndex !== sftpIndex) };
+    }
     await persistConfig(updateDefaultAfterDelete(draft, nextDraft, selectedTarget));
     setSelectedTarget('local');
     setServiceDialog(null);
+  }
+
+  async function makeDefaultTarget(target) {
+    if (currentDefaultTarget === target) return;
+    try {
+      await persistConfig(syncDefaultTarget(draft, target));
+      onMessage('默认文件服务已更新');
+    } catch (err) {
+      onError(err.message);
+    }
+  }
+
+  function renderDefaultSwitch(target) {
+    const checked = currentDefaultTarget === target;
+    return (
+      <button
+        className={checked ? 'default-switch active' : 'default-switch'}
+        type="button"
+        role="switch"
+        aria-checked={checked}
+        aria-label={checked ? '当前默认文件服务' : '设为默认文件服务'}
+        title={checked ? '当前默认文件服务' : '设为默认文件服务'}
+        onClick={() => makeDefaultTarget(target)}
+      >
+        <span className="default-switch-track"><span className="default-switch-thumb" /></span>
+        <span>{checked ? '默认' : '非默认'}</span>
+      </button>
+    );
   }
 
   return (
@@ -790,11 +1125,11 @@ function ConfigPanel({ configState, selectedTarget, setSelectedTarget, onSaved, 
             </div>
           </div>
           <div className="form-grid">
-            <Field label="key" value={draft.key} onChange={(value) => update('key', value)} />
-            <Field label="rename" value={draft.rename} onChange={(value) => update('rename', value)} />
-            <Field label="host" value={draft.host} onChange={(value) => update('host', value)} />
-            <Field label="port" type="number" value={draft.port || ''} onChange={(value) => update('port', Number(value) || 0)} />
-            <Field label="basePath" value={draft.basePath} onChange={(value) => update('basePath', value)} />
+            <Field label={fieldLabel('key')} value={draft.key} onChange={(value) => update('key', value)} />
+            <Field label={fieldLabel('rename')} value={draft.rename} onChange={(value) => update('rename', value)} />
+            <Field label={fieldLabel('host')} value={draft.host} onChange={(value) => update('host', value)} />
+            <Field label={fieldLabel('port')} type="number" value={draft.port || ''} onChange={(value) => update('port', Number(value) || 0)} />
+            <Field label={fieldLabel('basePath')} value={draft.basePath} onChange={(value) => update('basePath', value)} />
           </div>
           <div className="row-actions">
             <button onClick={save}>保存公共配置</button>
@@ -810,6 +1145,7 @@ function ConfigPanel({ configState, selectedTarget, setSelectedTarget, onSaved, 
             <div className="row-actions">
               <button className="ghost" onClick={() => setServiceDialog({ mode: 'create-s3' })}>新增 S3</button>
               <button className="ghost" onClick={() => setServiceDialog({ mode: 'create-webdav' })}>新增 WebDAV</button>
+              <button className="ghost" onClick={() => setServiceDialog({ mode: 'create-sftp' })}>新增 SFTP</button>
             </div>
           </div>
 
@@ -825,7 +1161,7 @@ function ConfigPanel({ configState, selectedTarget, setSelectedTarget, onSaved, 
               title="配置当前服务"
               onClick={() => setServiceDialog({ mode: 'edit', target: selectedTarget })}
             >
-              ⚙
+              <SquarePen size={18} strokeWidth={2.2} />
             </button>
           </div>
 
@@ -833,12 +1169,12 @@ function ConfigPanel({ configState, selectedTarget, setSelectedTarget, onSaved, 
             <div className="service-card">
               <div className="s3-title">
                 <strong>Local 文件服务</strong>
-                <span className={currentDefaultTarget === 'local' ? 'pill ok' : 'pill'}>{currentDefaultTarget === 'local' ? '默认' : '未设为默认'}</span>
+                {renderDefaultSwitch('local')}
               </div>
               <p className="muted">当前根目录：{configState.runtime.localRoot}</p>
               <div className="summary-grid">
-                <SummaryItem label="filePath" value={draft.filePath || '(默认当前工作目录)'} />
-                <SummaryItem label="urlPrefix" value={draft.urlPrefix || '(按请求 Host 生成)'} />
+                <SummaryItem label={fieldLabel('filePath')} value={draft.filePath || '(默认当前工作目录)'} />
+                <SummaryItem label={fieldLabel('urlPrefix')} value={draft.urlPrefix || '(按请求 Host 生成)'} />
               </div>
             </div>
           )}
@@ -847,15 +1183,15 @@ function ConfigPanel({ configState, selectedTarget, setSelectedTarget, onSaved, 
             <div className="service-card">
               <div className="s3-title">
                 <strong>{selectedS3.name || selectedS3.bucket || `S3 ${s3Index + 1}`}</strong>
-                <span className={currentDefaultTarget === selectedTarget ? 'pill ok' : 'pill'}>{currentDefaultTarget === selectedTarget ? '默认' : '未设为默认'}</span>
+                {renderDefaultSwitch(selectedTarget)}
               </div>
               <div className="summary-grid">
-                <SummaryItem label="bucket" value={selectedS3.bucket || '-'} />
-                <SummaryItem label="region" value={selectedS3.region || '-'} />
-                <SummaryItem label="endpoint" value={selectedS3.endpoint || '-'} />
-                <SummaryItem label="uploadPath" value={selectedS3.uploadPath || '-'} />
-                <SummaryItem label="urlPrefix" value={selectedS3.urlPrefix || '-'} />
-                <SummaryItem label="accessKeyID" value={selectedS3.accessKeyID || '-'} />
+                <SummaryItem label={fieldLabel('bucket')} value={selectedS3.bucket || '-'} />
+                <SummaryItem label={fieldLabel('region')} value={selectedS3.region || '-'} />
+                <SummaryItem label={fieldLabel('endpoint')} value={selectedS3.endpoint || '-'} />
+                <SummaryItem label={fieldLabel('uploadPath')} value={selectedS3.uploadPath || '-'} />
+                <SummaryItem label={fieldLabel('urlPrefix')} value={selectedS3.urlPrefix || '-'} />
+                <SummaryItem label={fieldLabel('accessKeyID')} value={selectedS3.accessKeyID || '-'} />
               </div>
             </div>
           )}
@@ -864,14 +1200,32 @@ function ConfigPanel({ configState, selectedTarget, setSelectedTarget, onSaved, 
             <div className="service-card">
               <div className="s3-title">
                 <strong>{selectedWebDAV.name || selectedWebDAV.endpoint || `WebDAV ${webdavIndex + 1}`}</strong>
-                <span className={currentDefaultTarget === selectedTarget ? 'pill ok' : 'pill'}>{currentDefaultTarget === selectedTarget ? '默认' : '未设为默认'}</span>
+                {renderDefaultSwitch(selectedTarget)}
               </div>
               <div className="summary-grid">
-                <SummaryItem label="endpoint" value={selectedWebDAV.endpoint || '-'} />
-                <SummaryItem label="rootPath" value={selectedWebDAV.rootPath || '-'} />
-                <SummaryItem label="uploadPath" value={selectedWebDAV.uploadPath || '-'} />
-                <SummaryItem label="urlPrefix" value={selectedWebDAV.urlPrefix || '-'} />
-                <SummaryItem label="username" value={selectedWebDAV.username || '-'} />
+                <SummaryItem label={fieldLabel('endpoint')} value={selectedWebDAV.endpoint || '-'} />
+                <SummaryItem label={fieldLabel('rootPath')} value={selectedWebDAV.rootPath || '-'} />
+                <SummaryItem label={fieldLabel('uploadPath')} value={selectedWebDAV.uploadPath || '-'} />
+                <SummaryItem label={fieldLabel('urlPrefix')} value={selectedWebDAV.urlPrefix || '-'} />
+                <SummaryItem label={fieldLabel('username')} value={selectedWebDAV.username || '-'} />
+              </div>
+            </div>
+          )}
+
+          {selectedTarget.startsWith('sftp:') && selectedSFTP && (
+            <div className="service-card">
+              <div className="s3-title">
+                <strong>{selectedSFTP.name || selectedSFTP.host || `SFTP ${sftpIndex + 1}`}</strong>
+                {renderDefaultSwitch(selectedTarget)}
+              </div>
+              <div className="summary-grid">
+                <SummaryItem label={fieldLabel('host')} value={selectedSFTP.host || '-'} />
+                <SummaryItem label={fieldLabel('port')} value={selectedSFTP.port || 22} />
+                <SummaryItem label={fieldLabel('rootPath')} value={selectedSFTP.rootPath || '-'} />
+                <SummaryItem label={fieldLabel('uploadPath')} value={selectedSFTP.uploadPath || '-'} />
+                <SummaryItem label={fieldLabel('urlPrefix')} value={selectedSFTP.urlPrefix || '-'} />
+                <SummaryItem label={fieldLabel('username')} value={selectedSFTP.username || '-'} />
+                <SummaryItem label={fieldLabel('privateKey')} value={selectedSFTP.privateKey ? '已配置' : '未配置'} />
               </div>
             </div>
           )}
@@ -881,47 +1235,85 @@ function ConfigPanel({ configState, selectedTarget, setSelectedTarget, onSaved, 
       {serviceDialog && (
         <ServiceConfigDialog
           key={`${serviceDialog.mode}:${serviceDialog.target || 'new'}`}
-          title={serviceDialog.mode === 'create-s3' ? '新增 S3 文件服务' : serviceDialog.mode === 'create-webdav' ? '新增 WebDAV 文件服务' : `配置 ${selectedServiceName}`}
+          title={serviceDialog.mode === 'create-s3' ? '新增 S3 文件服务' : serviceDialog.mode === 'create-webdav' ? '新增 WebDAV 文件服务' : serviceDialog.mode === 'create-sftp' ? '新增 SFTP 文件服务' : `配置 ${selectedServiceName}`}
           mode={serviceDialog.mode}
           target={serviceDialog.target || selectedTarget}
           runtime={configState.runtime}
           localValues={{ filePath: draft.filePath || '', urlPrefix: draft.urlPrefix || '' }}
           s3Values={serviceDialog.mode === 'create-s3' ? emptyS3 : selectedS3}
           webdavValues={serviceDialog.mode === 'create-webdav' ? emptyWebDAV : selectedWebDAV}
+          sftpValues={serviceDialog.mode === 'create-sftp' ? emptySFTP : selectedSFTP}
           onCancel={() => setServiceDialog(null)}
-          onSave={serviceDialog.mode === 'create-s3' ? createS3 : serviceDialog.mode === 'create-webdav' ? createWebDAV : saveService}
+          onSave={serviceDialog.mode === 'create-s3' ? createS3 : serviceDialog.mode === 'create-webdav' ? createWebDAV : serviceDialog.mode === 'create-sftp' ? createSFTP : saveService}
           onDelete={deleteService}
+          onMessage={onMessage}
+          onWarn={onWarn}
+          onError={onError}
         />
       )}
     </section>
   );
 }
 
-function ServiceConfigDialog({ title, mode, target, runtime, localValues, s3Values, webdavValues, onCancel, onSave, onDelete }) {
+function ServiceConfigDialog({ title, mode, target, runtime, localValues, s3Values, webdavValues, sftpValues, onCancel, onSave, onDelete, onMessage, onWarn, onError }) {
   const isCreateS3 = mode === 'create-s3';
   const isCreateWebDAV = mode === 'create-webdav';
-  const isLocal = target === 'local' && !isCreateS3 && !isCreateWebDAV;
+  const isCreateSFTP = mode === 'create-sftp';
+  const isLocal = target === 'local' && !isCreateS3 && !isCreateWebDAV && !isCreateSFTP;
   const isWebDAV = isCreateWebDAV || target.startsWith('webdav:');
-  const remoteDefaults = isWebDAV ? emptyWebDAV : emptyS3;
-  const remoteValues = isWebDAV ? webdavValues : s3Values;
+  const isSFTP = isCreateSFTP || target.startsWith('sftp:');
+  const remoteDefaults = isSFTP ? emptySFTP : isWebDAV ? emptyWebDAV : emptyS3;
+  const remoteValues = isSFTP ? sftpValues : isWebDAV ? webdavValues : s3Values;
   const [values, setValues] = useState(isLocal ? localValues : { ...remoteDefaults, ...(remoteValues || {}) });
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
-  const [result, setResult] = useState(null);
+  const [pendingHostKeyFingerprint, setPendingHostKeyFingerprint] = useState('');
+  const [hostKeyConfirm, setHostKeyConfirm] = useState(false);
+  const valuesRef = useRef(values);
+  useEffect(() => {
+    valuesRef.current = values;
+  }, [values]);
 
   function update(field, value) {
-    setValues((current) => ({ ...current, [field]: value }));
+    if (isSFTP && (field === 'host' || field === 'port')) {
+      setPendingHostKeyFingerprint('');
+      onWarn('服务器地址已变化，请重新测试并接受服务器指纹。');
+      const nextValues = {
+        ...valuesRef.current,
+        [field]: field === 'port' ? Number(value) || 0 : value,
+        hostKeyFingerprint: '',
+      };
+      valuesRef.current = nextValues;
+      setValues(nextValues);
+      return;
+    }
+    const nextValues = { ...valuesRef.current, [field]: field === 'port' ? Number(value) || 0 : value };
+    valuesRef.current = nextValues;
+    setValues(nextValues);
+  }
+
+  function acceptHostKey() {
+    const nextValues = {
+      ...valuesRef.current,
+      hostKeyFingerprint: pendingHostKeyFingerprint,
+    };
+    valuesRef.current = nextValues;
+    setValues(nextValues);
+    setPendingHostKeyFingerprint('');
+    onWarn('服务器指纹已接受，请再次测试验证登录。');
   }
 
   async function handleSave() {
     setSaving(true);
-    setResult(null);
     let failed = false;
     try {
-      await onSave(values);
+      if (isSFTP && !String(valuesRef.current.hostKeyFingerprint || '').trim()) {
+        throw new Error('请先测试连通性并接受服务器指纹');
+      }
+      await onSave(valuesRef.current);
     } catch (err) {
       failed = true;
-      setResult({ type: 'bad', message: err.message });
+      onError(err.message);
     } finally {
       if (failed) setSaving(false);
     }
@@ -929,24 +1321,36 @@ function ServiceConfigDialog({ title, mode, target, runtime, localValues, s3Valu
 
   async function handleDelete() {
     setSaving(true);
-    setResult(null);
     try {
       await onDelete();
     } catch (err) {
-      setResult({ type: 'bad', message: err.message });
+      onError(err.message);
       setSaving(false);
     }
   }
 
   async function testRemote() {
     setTesting(true);
-    setResult(null);
+    setPendingHostKeyFingerprint('');
+    setHostKeyConfirm(false);
     try {
-      const path = isWebDAV ? '/webdav/test' : '/s3/test';
-      const data = await api(path, { method: 'POST', body: JSON.stringify(values) });
-      setResult({ type: 'ok', message: data.message || `${isWebDAV ? 'WebDAV' : 'S3'} 连通` });
+      const path = isSFTP ? '/sftp/test' : isWebDAV ? '/webdav/test' : '/s3/test';
+      const data = await api(path, { method: 'POST', body: JSON.stringify(valuesRef.current) });
+      if (isSFTP && data.hostKeyChanged && data.hostKeyFingerprint) {
+        setPendingHostKeyFingerprint(data.hostKeyFingerprint);
+        setHostKeyConfirm(true);
+        onWarn('服务器指纹发生变化，请确认可信后再接受。');
+        return;
+      }
+      if (isSFTP && data.hostKeyCaptured && data.hostKeyFingerprint) {
+        setPendingHostKeyFingerprint(data.hostKeyFingerprint);
+        setHostKeyConfirm(true);
+        onWarn('已捕获服务器指纹，请确认可信后再接受。');
+        return;
+      }
+      onMessage(data.message || `${isSFTP ? 'SFTP' : isWebDAV ? 'WebDAV' : 'S3'} 连通`);
     } catch (err) {
-      setResult({ type: 'bad', message: err.message });
+      onError(err.message);
     } finally {
       setTesting(false);
     }
@@ -967,28 +1371,48 @@ function ServiceConfigDialog({ title, mode, target, runtime, localValues, s3Valu
           <>
             <p className="muted">当前运行根目录：{runtime.localRoot}</p>
             <div className="form-grid">
-              <Field label="filePath" value={values.filePath} onChange={(value) => update('filePath', value)} />
-              <Field label="urlPrefix" value={values.urlPrefix} onChange={(value) => update('urlPrefix', value)} />
+              <Field label={fieldLabel('filePath')} value={values.filePath} onChange={(value) => update('filePath', value)} />
+              <Field label={fieldLabel('urlPrefix')} value={values.urlPrefix} onChange={(value) => update('urlPrefix', value)} />
             </div>
           </>
         ) : (
           <>
             <div className="form-grid">
-              {Object.keys(remoteDefaults).map((field) => (
-                <Field key={field} label={field} value={values[field] || ''} onChange={(value) => update(field, value)} />
-              ))}
+              {Object.keys(remoteDefaults)
+                .filter((field) => field !== 'hostKeyFingerprint')
+                .map((field) => (
+                  <Field
+                    key={field}
+                    label={fieldLabel(field)}
+                    type={field === 'port' ? 'number' : 'text'}
+                    multiline={field === 'privateKey'}
+                    wide={field === 'privateKey'}
+                    value={values[field] || ''}
+                    onChange={(value) => update(field, value)}
+                  />
+                ))}
             </div>
           </>
         )}
 
-        {result && <div className={`notice ${result.type}`}>{result.message}</div>}
-
         <div className="row-actions">
-          {!isLocal && !isCreateS3 && !isCreateWebDAV && <button className="danger" disabled={saving} onClick={handleDelete}>{saving ? '删除中...' : '删除配置'}</button>}
+          {!isLocal && !isCreateS3 && !isCreateWebDAV && !isCreateSFTP && <button className="danger" disabled={saving} onClick={handleDelete}>{saving ? '删除中...' : '删除配置'}</button>}
           {!isLocal && <button className="ghost" disabled={testing || saving} onClick={testRemote}>{testing ? '测试中...' : '测试连通性'}</button>}
           <button className="ghost" disabled={saving} onClick={onCancel}>取消</button>
           <button disabled={saving} onClick={handleSave}>{saving ? '保存中...' : '保存'}</button>
         </div>
+        {hostKeyConfirm && (
+          <ConfirmDialog
+            title="接受服务器指纹"
+            message={`确认信任 ${values.host || '该主机'}:${values.port || 22} 的 SFTP 服务器指纹？${pendingHostKeyFingerprint}`}
+            confirmText="接受"
+            onCancel={() => setHostKeyConfirm(false)}
+            onConfirm={() => {
+              setHostKeyConfirm(false);
+              acceptHostKey();
+            }}
+          />
+        )}
       </section>
     </div>,
     document.body,
@@ -1005,7 +1429,7 @@ function SummaryItem({ label, value }) {
 }
 
 function ConfirmDialog({ title, message, confirmText = '确认', onCancel, onConfirm }) {
-  return (
+  return createPortal(
     <div className="dialog-backdrop" role="presentation">
       <section className="dialog" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
         <p className="eyebrow">confirm</p>
@@ -1016,13 +1440,255 @@ function ConfirmDialog({ title, message, confirmText = '确认', onCancel, onCon
           <button className="danger" onClick={onConfirm}>{confirmText}</button>
         </div>
       </section>
-    </div>
+    </div>,
+    document.body,
   );
 }
 
-function FolderDialog({ path, onCancel, onCreate }) {
+const commandHistoryKey = 'upimg:sftp-command-history';
+
+function CommandDialog({ target, path, onClose, onError, onMessage }) {
+  const [command, setCommand] = useState('');
+  const [history, setHistory] = useState(() => loadCommandHistory());
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [output, setOutput] = useState([]);
+  const [connected, setConnected] = useState(false);
+  const [status, setStatus] = useState('正在连接...');
+  const [actualPath, setActualPath] = useState('');
+  const [maximized, setMaximized] = useState(false);
+  const socketRef = useRef(null);
+  const terminalRef = useRef(null);
+  const connectedRef = useRef(false);
+
+  useEffect(() => {
+    const url = adminSFTPTerminalURL(target);
+    const socket = new WebSocket(url);
+    socketRef.current = socket;
+    const connectTimer = window.setTimeout(() => {
+      if (socket.readyState !== WebSocket.CONNECTING) return;
+      setStatus('WebSocket 仍在连接');
+      appendOutput({ type: 'warning', data: `WebSocket 连接尚未建立：${url}\n` });
+    }, 5000);
+    socket.onopen = () => {
+      window.clearTimeout(connectTimer);
+      setStatus('正在建立 SSH 连接...');
+      socket.send(JSON.stringify({ type: 'init', path }));
+    };
+    socket.onmessage = (event) => {
+      const message = parseJSON(event.data);
+      if (!message) return;
+      if (message.type === 'ready') {
+        connectedRef.current = true;
+        setConnected(true);
+        setActualPath(message.actualPath || '');
+        setStatus(message.message || 'SSH 已连接');
+        appendOutput({ type: 'status', data: `${message.message || 'SSH 已连接'}\n` });
+        return;
+      }
+      if (message.type === 'stdout' || message.type === 'stderr') {
+        appendOutput({ type: message.type, data: cleanTerminalOutput(message.data || '') });
+        return;
+      }
+      if (message.type === 'status') {
+        setStatus(message.message || 'SSH 已连接');
+        appendOutput({ type: 'status', data: `${message.message || 'status'}\n` });
+        return;
+      }
+      if (message.type === 'error') {
+        setStatus('执行失败');
+        appendOutput({ type: 'error', data: `${message.message || '执行失败'}\n` });
+        return;
+      }
+      if (message.type === 'done') {
+        connectedRef.current = false;
+        setConnected(false);
+        setStatus('SSH 连接已关闭');
+        appendOutput({ type: 'warning', data: 'SSH 连接已关闭\n' });
+      }
+    };
+    socket.onerror = () => {
+      window.clearTimeout(connectTimer);
+      connectedRef.current = false;
+      setConnected(false);
+      setStatus('连接失败');
+      appendOutput({ type: 'error', data: `WebSocket 或 SSH 连接失败：${url}\n` });
+      onError('命令终端连接失败');
+    };
+    socket.onclose = () => {
+      window.clearTimeout(connectTimer);
+      if (socketRef.current === socket) socketRef.current = null;
+      if (connectedRef.current) {
+        appendOutput({ type: 'warning', data: '连接已关闭\n' });
+      }
+      connectedRef.current = false;
+      setConnected(false);
+      setStatus((current) => (current === '连接失败' ? current : '连接已关闭'));
+    };
+    return () => {
+      window.clearTimeout(connectTimer);
+      closeTerminalSocket(socket);
+    };
+  }, [target, path]);
+
+  useEffect(() => {
+    terminalRef.current?.scrollTo({ top: terminalRef.current.scrollHeight });
+  }, [output]);
+
+  function appendOutput(entry) {
+    setOutput((current) => [...current, { id: `${Date.now()}-${current.length}`, ...entry }]);
+  }
+
+  function selectHistory(item) {
+    setCommand(item);
+    setHistoryOpen(false);
+  }
+
+  function runCommand(event) {
+    event.preventDefault();
+    const nextCommand = command.trim();
+    const socket = socketRef.current;
+    if (!nextCommand || !connected || !socket || socket.readyState !== WebSocket.OPEN) return;
+
+    const nextHistory = saveCommandHistory(nextCommand, history);
+    setHistory(nextHistory);
+    setHistoryOpen(false);
+    appendOutput({ type: 'command', data: `$ ${nextCommand}\n` });
+    socket.send(JSON.stringify({ type: 'command', command: nextCommand }));
+    setCommand('');
+  }
+
+  function interruptCommand() {
+    const socket = socketRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    socket.send(JSON.stringify({ type: 'interrupt' }));
+    setStatus('正在中断...');
+  }
+
+  function closeDialog() {
+    closeTerminalSocket(socketRef.current);
+    onClose();
+  }
+
+  return createPortal(
+    <div className="dialog-backdrop" role="presentation">
+      <section className={maximized ? 'dialog command-dialog maximized' : 'dialog command-dialog'} role="dialog" aria-modal="true" aria-labelledby="command-title">
+        <div className="command-head">
+          <div>
+            <p className="eyebrow">终端<span>{actualPath ? ` (${actualPath})` : ''}</span></p>
+          </div>
+          <div className="command-window-actions">
+            <button className="tiny-icon" type="button" onClick={() => setOutput([])} aria-label="清空终端内容" title="清空终端内容">
+              <Eraser size={16} strokeWidth={2.2} />
+            </button>
+            <button className="tiny-icon" type="button" onClick={() => setMaximized((value) => !value)} aria-label={maximized ? '还原窗口' : '最大化窗口'} title={maximized ? '还原窗口' : '最大化窗口'}>
+              {maximized ? <Minimize2 size={16} strokeWidth={2.2} /> : <Maximize2 size={16} strokeWidth={2.2} />}
+            </button>
+            <button className="icon-close" type="button" onClick={closeDialog} aria-label="关闭命令终端">
+              <X size={18} strokeWidth={2.2} />
+            </button>
+          </div>
+        </div>
+        <form className="command-form" onSubmit={runCommand}>
+          <label className="field command-field">
+            <div className="command-input-wrap">
+              <input
+                autoFocus
+                value={command}
+                disabled={!connected}
+                onChange={(event) => setCommand(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Escape') setHistoryOpen(false);
+                }}
+                placeholder="例如 cd app && docker compose up"
+              />
+              <button
+                className={historyOpen ? 'path-history-toggle active' : 'path-history-toggle'}
+                type="button"
+                disabled={!connected}
+                aria-label="显示历史命令"
+                aria-expanded={historyOpen}
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => setHistoryOpen((open) => !open)}
+              >
+                <ChevronDown size={15} strokeWidth={2.2} />
+              </button>
+              <button className="path-history-toggle danger-icon" type="button" disabled={!connected} onClick={interruptCommand} aria-label="中断当前命令" title="中断当前命令">
+                <OctagonX size={15} strokeWidth={2.2} />
+              </button>
+              {historyOpen && (
+                <div className="command-history-menu" role="listbox" aria-label="历史命令">
+                  {history.length === 0 ? (
+                    <div className="path-history-empty">暂无历史命令</div>
+                  ) : (
+                    history.map((item) => (
+                      <button key={item} type="button" role="option" onMouseDown={() => selectHistory(item)}>
+                        {item}
+                      </button>
+                    ))
+                  )}
+                </div>
+              )}
+            </div>
+          </label>
+        </form>
+        <div className="terminal-frame" ref={terminalRef} aria-live="polite" aria-label="终端输出">
+          {output.length === 0 ? (
+            <span className="terminal-empty">命令输出会显示在这里。</span>
+          ) : (
+            output.map((item) => (
+              <span className={`terminal-line ${item.type}`} key={item.id}>{item.data}</span>
+            ))
+          )}
+        </div>
+      </section>
+    </div>,
+    document.body,
+  );
+}
+
+function closeTerminalSocket(socket) {
+  if (!socket) return;
+  if (socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ type: 'close' }));
+  }
+  if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+    socket.close();
+  }
+}
+
+function cleanTerminalOutput(value) {
+  return String(value || '')
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/\x1b[()][A-Za-z0-9]/g, '')
+    .replace(/\[\?2004[hl]/g, '')
+    .replace(/\]0;[^\x07]*(?:\x07|$)/g, '')
+    .replace(/\]1337;[^\x07]*(?:\x07|$)/g, '')
+    .replace(/\x07/g, '')
+    .replace(/\r(?!\n)/g, '\n');
+}
+
+function loadCommandHistory() {
+  try {
+    const value = JSON.parse(window.localStorage.getItem(commandHistoryKey) || '[]');
+    return Array.isArray(value) ? value.filter((item) => typeof item === 'string').slice(0, 20) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveCommandHistory(command, current) {
+  const next = [command, ...current.filter((item) => item !== command)].slice(0, 20);
+  try {
+    window.localStorage.setItem(commandHistoryKey, JSON.stringify(next));
+  } catch {
+    // 历史记录只是便捷能力，存储失败不影响命令执行。
+  }
+  return next;
+}
+
+function FolderDialog({ path, onError, onCancel, onCreate }) {
   const [name, setName] = useState('');
-  const [error, setError] = useState('');
   const [saving, setSaving] = useState(false);
 
   async function handleSubmit(event) {
@@ -1030,15 +1696,14 @@ function FolderDialog({ path, onCancel, onCreate }) {
     const trimmed = name.trim();
     const validationError = validateFolderName(trimmed);
     if (validationError) {
-      setError(validationError);
+      onError(validationError);
       return;
     }
     setSaving(true);
-    setError('');
     try {
       await onCreate(trimmed);
     } catch (err) {
-      setError(err.message);
+      onError(err.message);
       setSaving(false);
     }
   }
@@ -1053,7 +1718,6 @@ function FolderDialog({ path, onCancel, onCreate }) {
           <span>文件夹名称</span>
           <input autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="例如 images" />
         </label>
-        {error && <div className="notice bad">{error}</div>}
         <div className="row-actions">
           <button type="button" className="ghost" disabled={saving} onClick={onCancel}>取消</button>
           <button type="submit" disabled={saving}>{saving ? '创建中...' : '创建'}</button>
@@ -1071,6 +1735,23 @@ function DeleteOverlay({ message }) {
         <span className="delete-spinner" aria-hidden="true" />
         <h3>{message || '正在删除...'}</h3>
         <p>请勿关闭页面或重复操作，删除完成后会自动刷新列表。</p>
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
+function ExtractOverlay({ item, path }) {
+  return createPortal(
+    <div className="extract-overlay" role="alert" aria-live="assertive" aria-busy="true">
+      <div className="extract-card">
+        <div className="extract-animation" aria-hidden="true">
+          <span />
+          <span />
+          <span />
+        </div>
+        <h3>正在解压缩 {item?.displayName || basename(item?.path || '')}</h3>
+        <p>目标目录：{path ? `/${path}` : '/'}。请勿关闭页面或重复操作，完成后会自动刷新列表。</p>
       </div>
     </div>,
     document.body,
@@ -1204,7 +1885,6 @@ function PreviewDialog({ preview, onClose }) {
         {preview.type === 'text' && (
           <div className="text-preview">
             {preview.loading && <p className="muted">正在加载文本...</p>}
-            {preview.error && <div className="notice bad">{preview.error}</div>}
             {typeof preview.text === 'string' && <pre>{preview.text}</pre>}
           </div>
         )}
@@ -1234,6 +1914,13 @@ function targetOptions(draft) {
       name: item.name || item.endpoint || `WebDAV ${index + 1}`,
     });
   });
+  (draft.sftp || []).forEach((item, index) => {
+    options.push({
+      id: `sftp:${index}`,
+      type: 'sftp',
+      name: item.name || item.host || `SFTP ${index + 1}`,
+    });
+  });
   return options;
 }
 
@@ -1241,7 +1928,7 @@ function selectedTargetID(targets) {
   return targets?.find((target) => target.selected)?.id || targets?.[0]?.id || 'local';
 }
 
-function serviceName(target, s3, webdav) {
+function serviceName(target, s3, webdav, sftp) {
   if (target === 'local') return 'Local 文件服务';
   if (target.startsWith('s3:')) {
     const index = Number(target.slice(3));
@@ -1251,15 +1938,15 @@ function serviceName(target, s3, webdav) {
     const index = Number(target.slice(7));
     return webdav?.name || webdav?.endpoint || `WebDAV ${index + 1}`;
   }
+  if (target.startsWith('sftp:')) {
+    const index = Number(target.slice(5));
+    return sftp?.name || sftp?.host || `SFTP ${index + 1}`;
+  }
   return target;
 }
 
 function effectiveDefaultTarget(draft) {
   if (draft.defaultTarget) return draft.defaultTarget;
-  const s3Index = (draft.s3 || []).findIndex((item) => item.selected);
-  if (s3Index >= 0) return `s3:${s3Index}`;
-  const webdavIndex = (draft.webdav || []).findIndex((item) => item.selected);
-  if (webdavIndex >= 0) return `webdav:${webdavIndex}`;
   return 'local';
 }
 
@@ -1268,8 +1955,9 @@ function syncDefaultTarget(draft, target) {
   return {
     ...draft,
     defaultTarget,
-    s3: (draft.s3 || []).map(stripSelected),
-    webdav: (draft.webdav || []).map(stripSelected),
+    s3: draft.s3 || [],
+    webdav: draft.webdav || [],
+    sftp: draft.sftp || [],
   };
 }
 
@@ -1279,14 +1967,10 @@ function updateDefaultAfterDelete(previousDraft, nextDraft, deletedTarget) {
   return {
     ...nextDraft,
     defaultTarget,
-    s3: (nextDraft.s3 || []).map(stripSelected),
-    webdav: (nextDraft.webdav || []).map(stripSelected),
+    s3: nextDraft.s3 || [],
+    webdav: nextDraft.webdav || [],
+    sftp: nextDraft.sftp || [],
   };
-}
-
-function stripSelected(item) {
-  const { selected: _selected, ...rest } = item || {};
-  return rest;
 }
 
 function remapDefaultAfterDelete(defaultTarget, deletedTarget) {
@@ -1299,16 +1983,24 @@ function remapDefaultAfterDelete(defaultTarget, deletedTarget) {
 }
 
 function parseIndexedTarget(target) {
-  const match = /^(s3|webdav):(\d+)$/.exec(target || '');
+  const match = /^(s3|webdav|sftp):(\d+)$/.exec(target || '');
   if (!match) return null;
   return { type: match[1], index: Number(match[2]) };
 }
 
-function Field({ label, value, onChange, type = 'text' }) {
+function fieldLabel(field) {
+  return fieldLabels[field] || field;
+}
+
+function Field({ label, value, onChange, type = 'text', multiline = false, wide = false }) {
   return (
-    <label className="field">
+    <label className={wide ? 'field wide' : 'field'}>
       <span>{label}</span>
-      <input type={type} value={value ?? ''} onChange={(event) => onChange(event.target.value)} />
+      {multiline ? (
+        <textarea value={value ?? ''} onChange={(event) => onChange(event.target.value)} />
+      ) : (
+        <input type={type} value={value ?? ''} onChange={(event) => onChange(event.target.value)} />
+      )}
     </label>
   );
 }
@@ -1356,6 +2048,20 @@ function isTextFile(item) {
   return Boolean(item?.url) && /\.(conf|css|csv|env|go|htm|html|ini|js|json|jsx|log|md|py|rs|sh|sql|toml|ts|tsx|txt|xml|ya?ml)$/i.test(item.path || '');
 }
 
+function isArchiveFile(item) {
+  return /\.(zip|tar|tar\.gz|tgz|tar\.bz2|tbz2|tar\.xz|txz|gz|bz2|xz)$/i.test(item?.path || '');
+}
+
+function triggerDownload(url, fileName) {
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = fileName || '';
+  link.style.display = 'none';
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+}
+
 function joinObjectPath(dir, name) {
   const cleanDir = String(dir || '').replace(/^\/+|\/+$/g, '');
   const cleanName = String(name || '').replace(/^\/+|\/+$/g, '');
@@ -1382,6 +2088,14 @@ function validateFolderName(value) {
   if (value === '.' || value === '..') return '文件夹名称不能是 . 或 ..';
   if (/[\\/]/.test(value)) return '文件夹名称不能包含路径分隔符';
   if (value.includes('\0')) return '文件夹名称包含非法字符';
+  return '';
+}
+
+function validateFileName(value) {
+  if (!value) return '文件名不能为空';
+  if (value === '.' || value === '..') return '文件名不能是 . 或 ..';
+  if (/[\\/]/.test(value)) return '文件名不能包含路径分隔符';
+  if (value.includes('\0')) return '文件名包含非法字符';
   return '';
 }
 

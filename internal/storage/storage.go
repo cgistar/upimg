@@ -42,6 +42,49 @@ type DirectoryDeleter interface {
 	DeleteDir(ctx context.Context, key string) error
 }
 
+type FileRenamer interface {
+	Rename(ctx context.Context, sourceKey, destinationKey string) error
+}
+
+type ArchiveExtractor interface {
+	ExtractArchive(ctx context.Context, key string, overwrite bool) error
+}
+
+type CommandSession interface {
+	ActualDir() string
+	WriteCommand(command string) error
+	Interrupt() error
+	Close() error
+	Wait() error
+}
+
+type CommandSessionOpener interface {
+	OpenCommandSession(ctx context.Context, dir string, stdout, stderr io.Writer) (CommandSession, error)
+}
+
+type PartialRenameError struct {
+	SourceKey      string
+	DestinationKey string
+	Cause          error
+}
+
+func (e *PartialRenameError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.Cause == nil {
+		return fmt.Sprintf("已复制到 %s，但删除源文件 %s 失败", e.DestinationKey, e.SourceKey)
+	}
+	return fmt.Sprintf("已复制到 %s，但删除源文件 %s 失败: %v", e.DestinationKey, e.SourceKey, e.Cause)
+}
+
+func (e *PartialRenameError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
+
 func normalizeListDir(value string) (string, error) {
 	value = strings.TrimSpace(strings.ReplaceAll(value, "\\", "/"))
 	if strings.Trim(value, "/") == "" {

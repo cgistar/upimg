@@ -5,15 +5,21 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"os"
+	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/coder/websocket"
+	"github.com/coder/websocket/wsjson"
 	"upimg/internal/config"
 	"upimg/internal/naming"
 	"upimg/internal/storage"
@@ -84,8 +90,11 @@ type adminTarget struct {
 }
 
 type adminGenericResponse struct {
-	Success bool   `json:"success"`
-	Message string `json:"message,omitempty"`
+	Success            bool   `json:"success"`
+	Message            string `json:"message,omitempty"`
+	HostKeyFingerprint string `json:"hostKeyFingerprint,omitempty"`
+	HostKeyCaptured    bool   `json:"hostKeyCaptured,omitempty"`
+	HostKeyChanged     bool   `json:"hostKeyChanged,omitempty"`
 }
 
 type adminBatchDeleteRequest struct {
@@ -96,10 +105,44 @@ type adminCreateFolderRequest struct {
 	Path string `json:"path"`
 }
 
+type adminRenameRequest struct {
+	Path string `json:"path"`
+	Name string `json:"name"`
+}
+
+type adminExtractRequest struct {
+	Path      string `json:"path"`
+	Overwrite bool   `json:"overwrite"`
+}
+
+type adminTerminalClientMessage struct {
+	Type    string `json:"type"`
+	Path    string `json:"path,omitempty"`
+	Command string `json:"command,omitempty"`
+	Data    string `json:"data,omitempty"`
+}
+
+type adminTerminalServerMessage struct {
+	Type        string `json:"type"`
+	Data        string `json:"data,omitempty"`
+	Message     string `json:"message,omitempty"`
+	ActualPath  string `json:"actualPath,omitempty"`
+	ExitCode    int    `json:"exitCode,omitempty"`
+	Interrupted bool   `json:"interrupted,omitempty"`
+}
+
 type adminBatchDeleteResponse struct {
 	Success bool     `json:"success"`
 	Deleted []string `json:"deleted,omitempty"`
 	Message string   `json:"message,omitempty"`
+}
+
+type adminRenameResponse struct {
+	Success bool   `json:"success"`
+	Partial bool   `json:"partial,omitempty"`
+	Path    string `json:"path,omitempty"`
+	URL     string `json:"url,omitempty"`
+	Message string `json:"message,omitempty"`
 }
 
 func (a *App) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
@@ -135,6 +178,16 @@ func (a *App) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a.handleAdminStorageObject(w, r)
+	case "/api/admin/storage/object/rename":
+		if !a.requireAdmin(w, r) {
+			return
+		}
+		a.handleAdminStorageObjectRename(w, r)
+	case "/api/admin/storage/object/extract":
+		if !a.requireAdmin(w, r) {
+			return
+		}
+		a.handleAdminStorageObjectExtract(w, r)
 	case "/api/admin/storage/objects":
 		if !a.requireAdmin(w, r) {
 			return
@@ -145,6 +198,11 @@ func (a *App) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a.handleAdminStoragePreview(w, r)
+	case "/api/admin/storage/download":
+		if !a.requireAdmin(w, r) {
+			return
+		}
+		a.handleAdminStorageDownload(w, r)
 	case "/api/admin/s3/test":
 		if !a.requireAdmin(w, r) {
 			return
@@ -155,6 +213,16 @@ func (a *App) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a.handleAdminWebDAVTest(w, r)
+	case "/api/admin/sftp/test":
+		if !a.requireAdmin(w, r) {
+			return
+		}
+		a.handleAdminSFTPTest(w, r)
+	case "/api/admin/sftp/terminal":
+		if !a.requireAdmin(w, r) {
+			return
+		}
+		a.handleAdminSFTPTerminal(w, r)
 	default:
 		writeAdminStatus(w, http.StatusNotFound, adminGenericResponse{Success: false, Message: "api not found"})
 	}
@@ -331,7 +399,7 @@ func (a *App) handleAdminStorageUpload(w http.ResponseWriter, r *http.Request) {
 		writeAdminStatus(w, http.StatusBadRequest, adminGenericResponse{Success: false, Message: err.Error()})
 		return
 	}
-	results, err := a.uploadMultipart(r, backend, strings.TrimSpace(r.URL.Query().Get("path")))
+	results, err := a.uploadMultipartOriginalName(r, backend, strings.TrimSpace(r.URL.Query().Get("path")))
 	if err != nil {
 		writeAdminStatus(w, http.StatusBadRequest, UploadResponse{Success: false, Message: err.Error()})
 		return
@@ -386,6 +454,99 @@ func (a *App) handleAdminStorageObject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeAdmin(w, adminGenericResponse{Success: true, Message: "deleted: " + key})
+}
+
+func (a *App) handleAdminStorageObjectRename(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		writeAdminStatus(w, http.StatusMethodNotAllowed, adminRenameResponse{Success: false, Message: "method not allowed"})
+		return
+	}
+	var payload adminRenameRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&payload); err != nil {
+		writeAdminStatus(w, http.StatusBadRequest, adminRenameResponse{Success: false, Message: "invalid json"})
+		return
+	}
+	sourceKey, destinationKey, err := renameDestination(payload.Path, payload.Name)
+	if err != nil {
+		writeAdminStatus(w, http.StatusBadRequest, adminRenameResponse{Success: false, Message: err.Error()})
+		return
+	}
+	backend, err := a.adminBackend(r.Context(), r.URL.Query().Get("target"))
+	if err != nil {
+		writeAdminStatus(w, http.StatusBadRequest, adminRenameResponse{Success: false, Message: err.Error()})
+		return
+	}
+	renamer, ok := backend.(storage.FileRenamer)
+	if !ok {
+		writeAdminStatus(w, http.StatusBadRequest, adminRenameResponse{Success: false, Message: "file rename is not supported"})
+		return
+	}
+	if err := renamer.Rename(r.Context(), sourceKey, destinationKey); err != nil {
+		var partial *storage.PartialRenameError
+		if errors.As(err, &partial) {
+			writeAdminStatus(w, http.StatusConflict, adminRenameResponse{
+				Success: false,
+				Partial: true,
+				Path:    destinationKey,
+				URL:     backend.FileURL(destinationKey, a.localBaseURL(baseURL(r))),
+				Message: partial.Error(),
+			})
+			return
+		}
+		writeAdminStatus(w, http.StatusBadRequest, adminRenameResponse{Success: false, Message: err.Error()})
+		return
+	}
+	writeAdmin(w, adminRenameResponse{
+		Success: true,
+		Path:    destinationKey,
+		URL:     backend.FileURL(destinationKey, a.localBaseURL(baseURL(r))),
+		Message: "renamed",
+	})
+}
+
+func (a *App) handleAdminStorageObjectExtract(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeAdminStatus(w, http.StatusMethodNotAllowed, adminGenericResponse{Success: false, Message: "method not allowed"})
+		return
+	}
+	var payload adminExtractRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&payload); err != nil {
+		writeAdminStatus(w, http.StatusBadRequest, adminGenericResponse{Success: false, Message: "invalid json"})
+		return
+	}
+	target := r.URL.Query().Get("target")
+	if !strings.HasPrefix(strings.TrimSpace(target), "sftp:") {
+		writeAdminStatus(w, http.StatusBadRequest, adminGenericResponse{Success: false, Message: "archive extraction is only supported for sftp targets"})
+		return
+	}
+	key, err := naming.SafeRelative(payload.Path)
+	if err != nil {
+		writeAdminStatus(w, http.StatusBadRequest, adminGenericResponse{Success: false, Message: err.Error()})
+		return
+	}
+	if isDirectoryDeletePath(payload.Path) {
+		writeAdminStatus(w, http.StatusBadRequest, adminGenericResponse{Success: false, Message: "directory extraction is not supported"})
+		return
+	}
+	if !isSupportedArchivePath(key) {
+		writeAdminStatus(w, http.StatusBadRequest, adminGenericResponse{Success: false, Message: "unsupported archive format"})
+		return
+	}
+	backend, err := a.adminBackend(r.Context(), target)
+	if err != nil {
+		writeAdminStatus(w, http.StatusBadRequest, adminGenericResponse{Success: false, Message: err.Error()})
+		return
+	}
+	extractor, ok := backend.(storage.ArchiveExtractor)
+	if !ok {
+		writeAdminStatus(w, http.StatusBadRequest, adminGenericResponse{Success: false, Message: "archive extraction is not supported"})
+		return
+	}
+	if err := extractor.ExtractArchive(r.Context(), key, payload.Overwrite); err != nil {
+		writeAdminStatus(w, http.StatusBadRequest, adminGenericResponse{Success: false, Message: err.Error()})
+		return
+	}
+	writeAdmin(w, adminGenericResponse{Success: true, Message: "解压完成"})
 }
 
 func (a *App) handleAdminStorageObjects(w http.ResponseWriter, r *http.Request) {
@@ -464,6 +625,52 @@ func (a *App) handleAdminStoragePreview(w http.ResponseWriter, r *http.Request) 
 	_, _ = w.Write(data)
 }
 
+func (a *App) handleAdminStorageDownload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeAdminStatus(w, http.StatusMethodNotAllowed, adminGenericResponse{Success: false, Message: "method not allowed"})
+		return
+	}
+	rawPath := r.URL.Query().Get("path")
+	if isDirectoryDeletePath(rawPath) {
+		writeAdminStatus(w, http.StatusBadRequest, adminGenericResponse{Success: false, Message: "directory download is not supported"})
+		return
+	}
+	key, err := naming.SafeRelative(rawPath)
+	if err != nil {
+		writeAdminStatus(w, http.StatusBadRequest, adminGenericResponse{Success: false, Message: err.Error()})
+		return
+	}
+	backend, err := a.adminBackend(r.Context(), r.URL.Query().Get("target"))
+	if err != nil {
+		writeAdminStatus(w, http.StatusBadRequest, adminGenericResponse{Success: false, Message: err.Error()})
+		return
+	}
+	readerBackend, ok := backend.(interface {
+		OpenReader(context.Context, string) (io.ReadCloser, error)
+	})
+	if !ok {
+		writeAdminStatus(w, http.StatusBadRequest, adminGenericResponse{Success: false, Message: "download is not supported"})
+		return
+	}
+	reader, err := readerBackend.OpenReader(r.Context(), key)
+	if err != nil {
+		writeAdminStatus(w, http.StatusNotFound, adminGenericResponse{Success: false, Message: "file not found"})
+		return
+	}
+	defer reader.Close()
+
+	fileName := path.Base(key)
+	if contentType := mime.TypeByExtension(path.Ext(fileName)); contentType != "" {
+		w.Header().Set("Content-Type", contentType)
+	} else {
+		w.Header().Set("Content-Type", "application/octet-stream")
+	}
+	w.Header().Set("Content-Disposition", "attachment; filename="+strconv.Quote(fileName))
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.Copy(w, reader)
+}
+
 func deleteStoragePath(ctx context.Context, backend storage.Backend, rawPath string) (string, int, error) {
 	key, err := naming.SafeRelative(rawPath)
 	if err != nil {
@@ -485,8 +692,51 @@ func deleteStoragePath(ctx context.Context, backend storage.Backend, rawPath str
 	return key, http.StatusOK, nil
 }
 
+func renameDestination(rawPath, rawName string) (string, string, error) {
+	if isDirectoryDeletePath(rawPath) {
+		return "", "", fmt.Errorf("directory rename is not supported")
+	}
+	sourceKey, err := naming.SafeRelative(rawPath)
+	if err != nil {
+		return "", "", err
+	}
+	name := strings.TrimSpace(rawName)
+	if name == "" {
+		return "", "", fmt.Errorf("file name is required")
+	}
+	if name == "." || name == ".." {
+		return "", "", fmt.Errorf("file name is invalid")
+	}
+	if strings.ContainsAny(name, "/\\\x00") {
+		return "", "", fmt.Errorf("file name must not contain path separators")
+	}
+	dir := path.Dir(sourceKey)
+	destinationKey := name
+	if dir != "." && dir != "/" {
+		destinationKey = path.Join(dir, name)
+	}
+	destinationKey, err = naming.SafeRelative(destinationKey)
+	if err != nil {
+		return "", "", err
+	}
+	if destinationKey == sourceKey {
+		return "", "", fmt.Errorf("file name is unchanged")
+	}
+	return sourceKey, destinationKey, nil
+}
+
 func isDirectoryDeletePath(value string) bool {
 	return strings.HasSuffix(strings.TrimSpace(strings.ReplaceAll(value, "\\", "/")), "/")
+}
+
+func isSupportedArchivePath(value string) bool {
+	lower := strings.ToLower(value)
+	for _, suffix := range []string{".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz", ".gz", ".bz2", ".xz"} {
+		if strings.HasSuffix(lower, suffix) {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *App) handleAdminS3Test(w http.ResponseWriter, r *http.Request) {
@@ -549,6 +799,199 @@ func (a *App) handleAdminWebDAVTest(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeAdmin(w, adminGenericResponse{Success: true, Message: "webdav reachable"})
+}
+
+func (a *App) handleAdminSFTPTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeAdminStatus(w, http.StatusMethodNotAllowed, adminGenericResponse{Success: false, Message: "method not allowed"})
+		return
+	}
+	var cfg config.SFTPConfig
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&cfg); err != nil {
+		writeAdminStatus(w, http.StatusBadRequest, adminGenericResponse{Success: false, Message: "invalid json"})
+		return
+	}
+	if !cfg.Valid() {
+		writeAdminStatus(w, http.StatusBadRequest, adminGenericResponse{Success: false, Message: sftpConfigError(cfg)})
+		return
+	}
+	backend, err := a.sftpFactory(cfg)
+	if err != nil {
+		writeAdminStatus(w, http.StatusBadRequest, adminGenericResponse{Success: false, Message: err.Error()})
+		return
+	}
+	if probe, ok := backend.(interface{ Probe(context.Context) error }); ok {
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		err = probe.Probe(ctx)
+		cancel()
+		if err != nil {
+			var hostKeyErr *storage.SFTPHostKeyError
+			if errors.As(err, &hostKeyErr) && hostKeyErr.Fingerprint != "" {
+				if strings.TrimSpace(cfg.HostKeyFingerprint) == "" {
+					writeAdmin(w, adminGenericResponse{
+						Success:            true,
+						Message:            "sftp host key fingerprint captured; accept it only if you trust the server identity",
+						HostKeyFingerprint: hostKeyErr.Fingerprint,
+						HostKeyCaptured:    true,
+					})
+					return
+				}
+				writeAdmin(w, adminGenericResponse{
+					Success:            true,
+					Message:            "sftp host key fingerprint changed; update it only if you trust the server identity",
+					HostKeyFingerprint: hostKeyErr.Fingerprint,
+					HostKeyChanged:     true,
+				})
+				return
+			}
+			writeAdminStatus(w, http.StatusBadRequest, adminGenericResponse{Success: false, Message: err.Error()})
+			return
+		}
+	}
+	writeAdmin(w, adminGenericResponse{Success: true, Message: "sftp reachable"})
+}
+
+func (a *App) handleAdminSFTPTerminal(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeAdminStatus(w, http.StatusMethodNotAllowed, adminGenericResponse{Success: false, Message: "method not allowed"})
+		return
+	}
+	target := strings.TrimSpace(r.URL.Query().Get("target"))
+	if !strings.HasPrefix(target, "sftp:") {
+		writeAdminStatus(w, http.StatusBadRequest, adminGenericResponse{Success: false, Message: "terminal is only supported for sftp targets"})
+		return
+	}
+	backend, err := a.adminBackend(r.Context(), target)
+	if err != nil {
+		writeAdminStatus(w, http.StatusBadRequest, adminGenericResponse{Success: false, Message: err.Error()})
+		return
+	}
+	opener, ok := backend.(storage.CommandSessionOpener)
+	if !ok {
+		writeAdminStatus(w, http.StatusBadRequest, adminGenericResponse{Success: false, Message: "terminal is not supported"})
+		return
+	}
+
+	conn, err := websocket.Accept(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer conn.CloseNow()
+	conn.SetReadLimit(1 << 20)
+
+	connCtx, cancelConn := context.WithCancel(context.Background())
+	defer cancelConn()
+	sender := &adminTerminalSender{conn: conn, ctx: connCtx}
+
+	var init adminTerminalClientMessage
+	readCtx, cancelRead := context.WithTimeout(connCtx, 30*time.Second)
+	err = wsjson.Read(readCtx, conn, &init)
+	cancelRead()
+	if err != nil {
+		_ = conn.Close(websocket.StatusPolicyViolation, "init message is required")
+		return
+	}
+	if init.Type != "init" {
+		_ = sender.send(adminTerminalServerMessage{Type: "error", Message: "first message must be init"})
+		_ = conn.Close(websocket.StatusPolicyViolation, "first message must be init")
+		return
+	}
+
+	_ = sender.send(adminTerminalServerMessage{Type: "status", Message: "正在建立 SSH 连接..."})
+	commandSession, err := opener.OpenCommandSession(
+		connCtx,
+		init.Path,
+		adminTerminalWriter{kind: "stdout", sender: sender},
+		adminTerminalWriter{kind: "stderr", sender: sender},
+	)
+	if err != nil {
+		_ = sender.send(adminTerminalServerMessage{Type: "error", Message: err.Error()})
+		_ = conn.Close(websocket.StatusInternalError, err.Error())
+		return
+	}
+	defer commandSession.Close()
+	_ = sender.send(adminTerminalServerMessage{
+		Type:       "ready",
+		Message:    "SSH 已连接",
+		ActualPath: commandSession.ActualDir(),
+	})
+
+	done := make(chan error, 1)
+	go func() {
+		done <- commandSession.Wait()
+	}()
+
+	readErr := make(chan error, 1)
+	go func() {
+		for {
+			var msg adminTerminalClientMessage
+			if err := wsjson.Read(connCtx, conn, &msg); err != nil {
+				readErr <- err
+				return
+			}
+			switch msg.Type {
+			case "command":
+				command := msg.Command
+				if command == "" {
+					command = msg.Data
+				}
+				if err := commandSession.WriteCommand(command); err != nil {
+					_ = sender.send(adminTerminalServerMessage{Type: "error", Message: err.Error()})
+				}
+			case "interrupt":
+				_ = sender.send(adminTerminalServerMessage{Type: "status", Message: "正在中断命令..."})
+				if err := commandSession.Interrupt(); err != nil {
+					_ = sender.send(adminTerminalServerMessage{Type: "error", Message: err.Error()})
+				}
+			case "close":
+				readErr <- nil
+				return
+			}
+		}
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			_ = sender.send(adminTerminalServerMessage{Type: "error", Message: err.Error()})
+		}
+		_ = sender.send(adminTerminalServerMessage{Type: "done"})
+	case <-readErr:
+		_ = commandSession.Close()
+		_ = sender.send(adminTerminalServerMessage{Type: "done"})
+	case <-connCtx.Done():
+		_ = commandSession.Close()
+	}
+	_ = conn.Close(websocket.StatusNormalClosure, "")
+}
+
+type adminTerminalSender struct {
+	conn *websocket.Conn
+	ctx  context.Context
+	mu   sync.Mutex
+}
+
+func (s *adminTerminalSender) send(message adminTerminalServerMessage) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
+	defer cancel()
+	return wsjson.Write(ctx, s.conn, message)
+}
+
+type adminTerminalWriter struct {
+	kind   string
+	sender *adminTerminalSender
+}
+
+func (w adminTerminalWriter) Write(data []byte) (int, error) {
+	if len(data) == 0 {
+		return 0, nil
+	}
+	if err := w.sender.send(adminTerminalServerMessage{Type: w.kind, Data: string(data)}); err != nil {
+		return 0, err
+	}
+	return len(data), nil
 }
 
 func (a *App) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
@@ -633,32 +1076,6 @@ func (a *App) buildRuntimeBackend(ctx context.Context, runtime config.Runtime) (
 		return backend, nil
 	}
 
-	for i, selected := range runtime.Config.S3 {
-		if !selected.Selected || !selected.Valid() {
-			continue
-		}
-		backend, err := a.backendForTargetConfig(ctx, runtime, fmt.Sprintf("s3:%d", i))
-		if err != nil {
-			continue
-		}
-		if err := probeBackend(ctx, backend); err != nil {
-			continue
-		}
-		return backend, nil
-	}
-	for i, selected := range runtime.Config.WebDAV {
-		if !selected.Selected || !selected.Valid() {
-			continue
-		}
-		backend, err := a.backendForTargetConfig(ctx, runtime, fmt.Sprintf("webdav:%d", i))
-		if err != nil {
-			continue
-		}
-		if err := probeBackend(ctx, backend); err != nil {
-			continue
-		}
-		return backend, nil
-	}
 	return storage.NewLocal(runtime.LocalRoot)
 }
 
@@ -700,6 +1117,24 @@ func (a *App) backendForTargetConfig(ctx context.Context, runtime config.Runtime
 		backend, err := a.webdavFactory(cfg)
 		if err != nil {
 			return nil, fmt.Errorf("create webdav target: %w", err)
+		}
+		return backend, nil
+	}
+	if strings.HasPrefix(target, "sftp:") {
+		index, err := strconv.Atoi(strings.TrimPrefix(target, "sftp:"))
+		if err != nil || index < 0 {
+			return nil, fmt.Errorf("invalid sftp target")
+		}
+		if index >= len(runtime.Config.SFTP) {
+			return nil, fmt.Errorf("sftp target not found")
+		}
+		cfg := runtime.Config.SFTP[index]
+		if !cfg.Valid() {
+			return nil, fmt.Errorf("sftp target is invalid: %s", sftpConfigError(cfg))
+		}
+		backend, err := a.sftpFactory(cfg)
+		if err != nil {
+			return nil, fmt.Errorf("create sftp target: %w", err)
 		}
 		return backend, nil
 	}
@@ -791,6 +1226,24 @@ func (a *App) adminTargets(runtime config.Runtime) []adminTarget {
 			Invalid:  item.InvalidFields(),
 		})
 	}
+	for i, item := range runtime.Config.SFTP {
+		name := strings.TrimSpace(item.Name)
+		if name == "" {
+			name = strings.TrimSpace(item.Host)
+		}
+		if name == "" {
+			name = fmt.Sprintf("SFTP %d", i+1)
+		}
+		targets = append(targets, adminTarget{
+			ID:       fmt.Sprintf("sftp:%d", i),
+			Type:     "sftp",
+			Name:     name,
+			Selected: defaultTarget == fmt.Sprintf("sftp:%d", i),
+			Valid:    item.Valid(),
+			Missing:  item.MissingFields(),
+			Invalid:  item.InvalidFields(),
+		})
+	}
 	return targets
 }
 
@@ -817,18 +1270,20 @@ func validateAdminConfig(cfg config.Config) error {
 			return fmt.Errorf("webdav[%d] %s", i, webdavConfigError(item))
 		}
 	}
+	for i, item := range cfg.SFTP {
+		if !sftpConfigPresent(item) {
+			continue
+		}
+		if !item.Valid() {
+			return fmt.Errorf("sftp[%d] %s", i, sftpConfigError(item))
+		}
+	}
 	return nil
 }
 
 func normalizeAdminConfigForWrite(cfg config.Config) config.Config {
 	if strings.TrimSpace(cfg.DefaultTarget) == "" {
 		cfg.DefaultTarget = effectiveDefaultTarget(cfg)
-	}
-	for i := range cfg.S3 {
-		cfg.S3[i].Selected = false
-	}
-	for i := range cfg.WebDAV {
-		cfg.WebDAV[i].Selected = false
 	}
 	return cfg
 }
@@ -852,29 +1307,25 @@ func validateDefaultTarget(cfg config.Config) error {
 		}
 		return nil
 	}
-	return fmt.Errorf("defaultTarget must be local, s3:<index>, or webdav:<index>")
+	if strings.HasPrefix(target, "sftp:") {
+		index, err := strconv.Atoi(strings.TrimPrefix(target, "sftp:"))
+		if err != nil || index < 0 || index >= len(cfg.SFTP) {
+			return fmt.Errorf("defaultTarget points to missing sftp target")
+		}
+		return nil
+	}
+	return fmt.Errorf("defaultTarget must be local, s3:<index>, webdav:<index>, or sftp:<index>")
 }
 
 func effectiveDefaultTarget(cfg config.Config) string {
 	if target := strings.TrimSpace(cfg.DefaultTarget); target != "" {
 		return target
 	}
-	for i, item := range cfg.S3 {
-		if item.Selected && item.Valid() {
-			return fmt.Sprintf("s3:%d", i)
-		}
-	}
-	for i, item := range cfg.WebDAV {
-		if item.Selected && item.Valid() {
-			return fmt.Sprintf("webdav:%d", i)
-		}
-	}
 	return "local"
 }
 
 func s3ConfigPresent(cfg config.S3Config) bool {
-	return cfg.Selected ||
-		strings.TrimSpace(cfg.Name) != "" ||
+	return strings.TrimSpace(cfg.Name) != "" ||
 		strings.TrimSpace(cfg.Bucket) != "" ||
 		strings.TrimSpace(cfg.Region) != "" ||
 		strings.TrimSpace(cfg.AccessKeyID) != "" ||
@@ -885,8 +1336,7 @@ func s3ConfigPresent(cfg config.S3Config) bool {
 }
 
 func webdavConfigPresent(cfg config.WebDAVConfig) bool {
-	return cfg.Selected ||
-		strings.TrimSpace(cfg.Name) != "" ||
+	return strings.TrimSpace(cfg.Name) != "" ||
 		strings.TrimSpace(cfg.Endpoint) != "" ||
 		strings.TrimSpace(cfg.Username) != "" ||
 		strings.TrimSpace(cfg.Password) != "" ||
@@ -895,7 +1345,32 @@ func webdavConfigPresent(cfg config.WebDAVConfig) bool {
 		strings.TrimSpace(cfg.UploadPath) != ""
 }
 
+func sftpConfigPresent(cfg config.SFTPConfig) bool {
+	return strings.TrimSpace(cfg.Name) != "" ||
+		strings.TrimSpace(cfg.Host) != "" ||
+		cfg.Port != 0 ||
+		strings.TrimSpace(cfg.Username) != "" ||
+		strings.TrimSpace(cfg.Password) != "" ||
+		strings.TrimSpace(cfg.PrivateKey) != "" ||
+		strings.TrimSpace(cfg.Passphrase) != "" ||
+		strings.TrimSpace(cfg.HostKeyFingerprint) != "" ||
+		strings.TrimSpace(cfg.RootPath) != "" ||
+		strings.TrimSpace(cfg.URLPrefix) != "" ||
+		strings.TrimSpace(cfg.UploadPath) != ""
+}
+
 func webdavConfigError(cfg config.WebDAVConfig) string {
+	var parts []string
+	if missing := cfg.MissingFields(); len(missing) > 0 {
+		parts = append(parts, "missing "+strings.Join(missing, ", "))
+	}
+	if invalid := cfg.InvalidFields(); len(invalid) > 0 {
+		parts = append(parts, "invalid "+strings.Join(invalid, ", "))
+	}
+	return strings.Join(parts, "; ")
+}
+
+func sftpConfigError(cfg config.SFTPConfig) string {
 	var parts []string
 	if missing := cfg.MissingFields(); len(missing) > 0 {
 		parts = append(parts, "missing "+strings.Join(missing, ", "))

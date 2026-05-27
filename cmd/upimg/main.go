@@ -65,46 +65,6 @@ func buildBackend(ctx context.Context, runtime config.Runtime) (storage.Backend,
 		return backend, nil
 	}
 
-	for i, selected := range runtime.Config.S3 {
-		if !selected.Selected {
-			continue
-		}
-		if !selected.Valid() {
-			log.Printf("selected s3 config is invalid, fallback to local storage: %s missing %s", s3Label(selected), strings.Join(selected.MissingFields(), ", "))
-			continue
-		}
-
-		s3Backend, err := storage.NewS3(ctx, selected)
-		if err == nil {
-			if err := probeBackend(ctx, s3Backend); err == nil {
-				return s3Backend, nil
-			} else {
-				log.Printf("selected s3 is not reachable, fallback to local storage: %s target=s3:%d error=%v", s3Label(selected), i, err)
-			}
-		} else {
-			log.Printf("selected s3 config is invalid, fallback to local storage: %s error=%v", s3Label(selected), err)
-		}
-	}
-	for i, selected := range runtime.Config.WebDAV {
-		if !selected.Selected {
-			continue
-		}
-		if !selected.Valid() {
-			log.Printf("selected webdav config is invalid, fallback to local storage: %s %s", webdavLabel(selected), webdavConfigError(selected))
-			continue
-		}
-		webdavBackend, err := storage.NewWebDAV(selected)
-		if err == nil {
-			if err := probeBackend(ctx, webdavBackend); err == nil {
-				return webdavBackend, nil
-			} else {
-				log.Printf("selected webdav is not reachable, fallback to local storage: %s target=webdav:%d error=%v", webdavLabel(selected), i, err)
-			}
-		} else {
-			log.Printf("selected webdav config is invalid, fallback to local storage: %s error=%v", webdavLabel(selected), err)
-		}
-	}
-
 	local, err := storage.NewLocal(runtime.LocalRoot)
 	if err != nil {
 		return nil, err
@@ -141,7 +101,18 @@ func backendForTarget(ctx context.Context, runtime config.Runtime, target string
 		}
 		return storage.NewWebDAV(cfg)
 	}
-	return nil, fmt.Errorf("defaultTarget must be local, s3:<index>, or webdav:<index>")
+	if strings.HasPrefix(target, "sftp:") {
+		index, err := strconv.Atoi(strings.TrimPrefix(target, "sftp:"))
+		if err != nil || index < 0 || index >= len(runtime.Config.SFTP) {
+			return nil, fmt.Errorf("defaultTarget points to missing sftp target")
+		}
+		cfg := runtime.Config.SFTP[index]
+		if !cfg.Valid() {
+			return nil, fmt.Errorf("defaultTarget sftp target is invalid: %s", sftpConfigError(cfg))
+		}
+		return storage.NewSFTP(cfg)
+	}
+	return nil, fmt.Errorf("defaultTarget must be local, s3:<index>, webdav:<index>, or sftp:<index>")
 }
 
 func probeBackend(ctx context.Context, backend storage.Backend) error {
@@ -178,6 +149,17 @@ func webdavLabel(cfg config.WebDAVConfig) string {
 }
 
 func webdavConfigError(cfg config.WebDAVConfig) string {
+	var parts []string
+	if missing := cfg.MissingFields(); len(missing) > 0 {
+		parts = append(parts, "missing "+strings.Join(missing, ", "))
+	}
+	if invalid := cfg.InvalidFields(); len(invalid) > 0 {
+		parts = append(parts, "invalid "+strings.Join(invalid, ", "))
+	}
+	return strings.Join(parts, "; ")
+}
+
+func sftpConfigError(cfg config.SFTPConfig) string {
 	var parts []string
 	if missing := cfg.MissingFields(); len(missing) > 0 {
 		parts = append(parts, "missing "+strings.Join(missing, ", "))

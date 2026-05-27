@@ -29,6 +29,7 @@ type Config struct {
 	DefaultTarget string         `json:"defaultTarget"`
 	S3            []S3Config     `json:"s3"`
 	WebDAV        []WebDAVConfig `json:"webdav"`
+	SFTP          []SFTPConfig   `json:"sftp"`
 }
 
 type S3Config struct {
@@ -39,7 +40,6 @@ type S3Config struct {
 	Endpoint        string `json:"endpoint"`
 	URLPrefix       string `json:"urlPrefix"`
 	UploadPath      string `json:"uploadPath"`
-	Selected        bool   `json:"selected,omitempty"`
 	Name            string `json:"name"`
 }
 
@@ -51,7 +51,20 @@ type WebDAVConfig struct {
 	RootPath   string `json:"rootPath"`
 	URLPrefix  string `json:"urlPrefix"`
 	UploadPath string `json:"uploadPath"`
-	Selected   bool   `json:"selected,omitempty"`
+}
+
+type SFTPConfig struct {
+	Name               string `json:"name"`
+	Host               string `json:"host"`
+	Port               int    `json:"port"`
+	Username           string `json:"username"`
+	Password           string `json:"password"`
+	PrivateKey         string `json:"privateKey"`
+	Passphrase         string `json:"passphrase"`
+	HostKeyFingerprint string `json:"hostKeyFingerprint"`
+	RootPath           string `json:"rootPath"`
+	URLPrefix          string `json:"urlPrefix"`
+	UploadPath         string `json:"uploadPath"`
 }
 
 type Runtime struct {
@@ -258,15 +271,6 @@ func Path() (string, error) {
 	return "", nil
 }
 
-func SelectedS3(cfg Config) (S3Config, bool) {
-	for _, item := range cfg.S3 {
-		if item.Selected && item.Valid() {
-			return item, true
-		}
-	}
-	return S3Config{}, false
-}
-
 func (s S3Config) Valid() bool {
 	return len(s.MissingFields()) == 0
 }
@@ -316,6 +320,44 @@ func (w WebDAVConfig) InvalidFields() []string {
 		}
 	}
 	return invalid
+}
+
+func (s SFTPConfig) Valid() bool {
+	return len(s.MissingFields()) == 0 && len(s.InvalidFields()) == 0
+}
+
+func (s SFTPConfig) MissingFields() []string {
+	var missing []string
+	if strings.TrimSpace(s.Host) == "" {
+		missing = append(missing, "host")
+	}
+	if strings.TrimSpace(s.Username) == "" {
+		missing = append(missing, "username")
+	}
+	if strings.TrimSpace(s.Password) == "" && strings.TrimSpace(s.PrivateKey) == "" {
+		missing = append(missing, "password or privateKey")
+	}
+	return missing
+}
+
+func (s SFTPConfig) InvalidFields() []string {
+	var invalid []string
+	if s.Port < 0 || s.Port > 65535 {
+		invalid = append(invalid, "port")
+	}
+	if rootPath := strings.TrimSpace(s.RootPath); rootPath != "" {
+		if _, err := naming.SafeRemotePath(rootPath); err != nil {
+			invalid = append(invalid, "rootPath")
+		}
+	}
+	return invalid
+}
+
+func (s SFTPConfig) PortOrDefault() int {
+	if s.Port == 0 {
+		return 22
+	}
+	return s.Port
 }
 
 func isFile(path string) bool {

@@ -10,6 +10,7 @@ import (
 	"mime"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -32,6 +33,7 @@ type App struct {
 	backendCache  map[string]storage.Backend
 	s3Factory     func(context.Context, config.S3Config) (storage.Backend, error)
 	webdavFactory func(config.WebDAVConfig) (storage.Backend, error)
+	sftpFactory   func(config.SFTPConfig) (storage.Backend, error)
 	cacheMu       sync.Mutex
 
 	sessionMu  sync.Mutex
@@ -70,6 +72,7 @@ type namedTarget struct {
 	Type   string
 	S3     config.S3Config
 	WebDAV config.WebDAVConfig
+	SFTP   config.SFTPConfig
 }
 
 func New(runtime config.Runtime, backend storage.Backend) *App {
@@ -79,6 +82,9 @@ func New(runtime config.Runtime, backend storage.Backend) *App {
 		},
 		webdavFactory: func(cfg config.WebDAVConfig) (storage.Backend, error) {
 			return storage.NewWebDAV(cfg)
+		},
+		sftpFactory: func(cfg config.SFTPConfig) (storage.Backend, error) {
+			return storage.NewSFTP(cfg)
 		},
 		sessions:      map[string]time.Time{},
 		sessionTTL:    24 * time.Hour,
@@ -293,6 +299,18 @@ func (a *App) uploadJSON(r *http.Request, backend storage.Backend, target string
 }
 
 func (a *App) uploadMultipart(r *http.Request, backend storage.Backend, target string) ([]UploadResult, error) {
+	return a.uploadMultipartWith(r, func(fileName string, reader io.Reader) (UploadResult, error) {
+		return a.uploadReader(r.Context(), backend, fileName, target, baseURL(r), reader)
+	})
+}
+
+func (a *App) uploadMultipartOriginalName(r *http.Request, backend storage.Backend, target string) ([]UploadResult, error) {
+	return a.uploadMultipartWith(r, func(fileName string, reader io.Reader) (UploadResult, error) {
+		return a.uploadReaderOriginalName(r.Context(), backend, fileName, target, baseURL(r), reader)
+	})
+}
+
+func (a *App) uploadMultipartWith(r *http.Request, upload func(string, io.Reader) (UploadResult, error)) ([]UploadResult, error) {
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
 		return nil, fmt.Errorf("Error processing formData")
 	}
@@ -303,7 +321,7 @@ func (a *App) uploadMultipart(r *http.Request, backend storage.Backend, target s
 			if err != nil {
 				return nil, fmt.Errorf("Error processing formData")
 			}
-			result, err := a.uploadReader(r.Context(), backend, sanitizeFileName(header.Filename), target, baseURL(r), file)
+			result, err := upload(sanitizeFileName(header.Filename), file)
 			_ = file.Close()
 			if err != nil {
 				return nil, err
@@ -312,6 +330,35 @@ func (a *App) uploadMultipart(r *http.Request, backend storage.Backend, target s
 		}
 	}
 	return results, nil
+}
+
+func (a *App) uploadReaderOriginalName(ctx context.Context, backend storage.Backend, fileName, target, baseURL string, reader io.Reader) (UploadResult, error) {
+	key, err := originalUploadKey(fileName, target)
+	if err != nil {
+		return UploadResult{}, err
+	}
+	stored, err := backend.Put(ctx, key, fileName, reader)
+	if err != nil {
+		return UploadResult{}, err
+	}
+	return a.uploadResult(backend, key, baseURL, stored), nil
+}
+
+func originalUploadKey(fileName, target string) (string, error) {
+	fileName, err := naming.SafeRelative(sanitizeFileName(fileName))
+	if err != nil {
+		return "", err
+	}
+
+	target = strings.TrimSpace(strings.ReplaceAll(target, "\\", "/"))
+	if strings.Trim(target, "/") == "" {
+		return fileName, nil
+	}
+	target, err = naming.SafeRelative(target)
+	if err != nil {
+		return "", err
+	}
+	return path.Join(target, fileName), nil
 }
 
 func (a *App) uploadPath(ctx context.Context, backend storage.Backend, source, target, baseURL string) (UploadResult, error) {
@@ -341,12 +388,16 @@ func (a *App) uploadReader(ctx context.Context, backend storage.Backend, fileNam
 	if err != nil {
 		return UploadResult{}, err
 	}
+	return a.uploadResult(backend, key, baseURL, stored), nil
+}
+
+func (a *App) uploadResult(backend storage.Backend, key, baseURL string, stored storage.StoredObject) UploadResult {
 	if backend.Type() == "local" {
 		if localBaseURL := a.localBaseURL(baseURL); localBaseURL != "" {
 			stored.URL = backend.FileURL(key, localBaseURL)
 		}
 	}
-	return UploadResult{FileName: stored.FileName, ImgURL: stored.URL, Type: stored.Type}, nil
+	return UploadResult{FileName: stored.FileName, ImgURL: stored.URL, Type: stored.Type}
 }
 
 func (a *App) uploadDir(backend storage.Backend) string {
@@ -412,6 +463,17 @@ func namedTargets(cfg config.Config) map[string][]namedTarget {
 			ID:     fmt.Sprintf("webdav:%d", i),
 			Type:   "webdav",
 			WebDAV: item,
+		})
+	}
+	for i, item := range cfg.SFTP {
+		name := strings.TrimSpace(item.Name)
+		if name == "" {
+			continue
+		}
+		targets[name] = append(targets[name], namedTarget{
+			ID:   fmt.Sprintf("sftp:%d", i),
+			Type: "sftp",
+			SFTP: item,
 		})
 	}
 	return targets

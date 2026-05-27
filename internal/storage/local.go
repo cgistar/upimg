@@ -90,6 +90,47 @@ func (l *Local) Delete(ctx context.Context, key string) error {
 	return os.Remove(target)
 }
 
+func (l *Local) Rename(ctx context.Context, sourceKey, destinationKey string) error {
+	source, err := l.safePath(sourceKey)
+	if err != nil {
+		return err
+	}
+	destination, err := l.safePath(destinationKey)
+	if err != nil {
+		return err
+	}
+	info, err := os.Stat(source)
+	if err != nil {
+		return err
+	}
+	if info.IsDir() {
+		return fmt.Errorf("target is not a file")
+	}
+	if destinationInfo, err := os.Stat(destination); err == nil {
+		if !os.SameFile(info, destinationInfo) {
+			return fmt.Errorf("destination already exists")
+		}
+		temp := filepath.Join(filepath.Dir(source), fmt.Sprintf(".%s.%d.rename", filepath.Base(source), time.Now().UnixNano()))
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := os.Rename(source, temp); err != nil {
+			return err
+		}
+		if err := os.Rename(temp, destination); err != nil {
+			_ = os.Rename(temp, source)
+			return err
+		}
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return os.Rename(source, destination)
+}
+
 func (l *Local) CreateDir(ctx context.Context, key string) error {
 	key, err := normalizeDirectoryKey(key)
 	if err != nil {

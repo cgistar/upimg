@@ -2,8 +2,10 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"time"
@@ -13,6 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 	"upimg/internal/config"
 	"upimg/internal/naming"
 )
@@ -92,6 +95,37 @@ func (s *S3) Delete(ctx context.Context, key string) error {
 	return err
 }
 
+func (s *S3) Rename(ctx context.Context, sourceKey, destinationKey string) error {
+	sourceKey, err := naming.SafeRelative(sourceKey)
+	if err != nil {
+		return err
+	}
+	destinationKey, err = naming.SafeRelative(destinationKey)
+	if err != nil {
+		return err
+	}
+	// S3 CopyObject 不能对目标对象做原子 If-None-Match，这里只能先检查再复制。
+	if _, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(s.cfg.Bucket),
+		Key:    aws.String(destinationKey),
+	}); err == nil {
+		return fmt.Errorf("destination already exists")
+	} else if !isS3NotFound(err) {
+		return err
+	}
+	if _, err := s.client.CopyObject(ctx, &s3.CopyObjectInput{
+		Bucket:     aws.String(s.cfg.Bucket),
+		Key:        aws.String(destinationKey),
+		CopySource: aws.String(s.copySource(sourceKey)),
+	}); err != nil {
+		return err
+	}
+	if err := s.Delete(ctx, sourceKey); err != nil {
+		return &PartialRenameError{SourceKey: sourceKey, DestinationKey: destinationKey, Cause: err}
+	}
+	return nil
+}
+
 func (s *S3) DeleteDir(ctx context.Context, key string) error {
 	key, err := normalizeDirectoryKey(key)
 	if err != nil {
@@ -142,6 +176,25 @@ func (s *S3) deleteObjects(ctx context.Context, objects []types.ObjectIdentifier
 		Delete: &types.Delete{Objects: objects, Quiet: aws.Bool(true)},
 	})
 	return err
+}
+
+func (s *S3) copySource(key string) string {
+	escapedBucket := url.PathEscape(s.cfg.Bucket)
+	escapedKey := strings.ReplaceAll(url.PathEscape(key), "%2F", "/")
+	return escapedBucket + "/" + escapedKey
+}
+
+func isS3NotFound(err error) bool {
+	var apiErr smithy.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	switch apiErr.ErrorCode() {
+	case "NotFound", "NoSuchKey", "404":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *S3) OpenReader(ctx context.Context, key string) (io.ReadCloser, error) {
