@@ -33,6 +33,8 @@ const (
 	maxLoginFailures     = 5
 	loginFailureWindow   = time.Minute
 	loginLockout         = time.Minute
+	terminalPingInterval = 25 * time.Second
+	terminalPingTimeout  = 10 * time.Second
 )
 
 type loginFailure struct {
@@ -1225,6 +1227,7 @@ func (a *App) handleAdminSFTPTerminal(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}()
+	go keepAdminTerminalWebSocketAlive(connCtx, cancelConn, conn)
 
 	select {
 	case err := <-done:
@@ -1239,6 +1242,25 @@ func (a *App) handleAdminSFTPTerminal(w http.ResponseWriter, r *http.Request) {
 		_ = commandSession.Close()
 	}
 	_ = conn.Close(websocket.StatusNormalClosure, "")
+}
+
+func keepAdminTerminalWebSocketAlive(ctx context.Context, cancel context.CancelFunc, conn *websocket.Conn) {
+	ticker := time.NewTicker(terminalPingInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			pingCtx, cancelPing := context.WithTimeout(ctx, terminalPingTimeout)
+			err := conn.Ping(pingCtx)
+			cancelPing()
+			if err != nil {
+				cancel()
+				return
+			}
+		}
+	}
 }
 
 type adminTerminalSender struct {

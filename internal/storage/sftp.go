@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/url"
 	"os"
 	"path"
 	"strconv"
@@ -25,6 +24,11 @@ type SFTP struct {
 	cfg      config.SFTPConfig
 	rootPath string
 }
+
+const (
+	sftpCommandKeepaliveInterval = 25 * time.Second
+	sftpCommandKeepaliveTimeout  = 10 * time.Second
+)
 
 type SFTPHostKeyError struct {
 	Host        string
@@ -256,13 +260,15 @@ func (s *SFTP) OpenCommandSession(ctx context.Context, dir string, stdout, stder
 		return nil, err
 	}
 
+	keepaliveCtx, cancelKeepalive := context.WithCancel(ctx)
 	commandSession := &sftpCommandSession{
-		actualDir:  remoteDir,
-		sftpClient: sftpClient,
-		sshClient:  sshClient,
-		session:    session,
-		stdin:      stdin,
-		done:       make(chan error, 1),
+		actualDir:       remoteDir,
+		sftpClient:      sftpClient,
+		sshClient:       sshClient,
+		session:         session,
+		stdin:           stdin,
+		done:            make(chan error, 1),
+		cancelKeepalive: cancelKeepalive,
 	}
 	go func() {
 		commandSession.done <- session.Wait()
@@ -271,6 +277,7 @@ func (s *SFTP) OpenCommandSession(ctx context.Context, dir string, stdout, stder
 		<-ctx.Done()
 		_ = commandSession.Close()
 	}()
+	go commandSession.keepAlive(keepaliveCtx)
 	return commandSession, nil
 }
 
@@ -292,13 +299,14 @@ func (s *SFTP) ensureArchiveCommands(ctx context.Context, client *ssh.Client, fo
 }
 
 type sftpCommandSession struct {
-	actualDir  string
-	sftpClient *pkgsftp.Client
-	sshClient  *ssh.Client
-	session    *ssh.Session
-	stdin      io.WriteCloser
-	done       chan error
-	closeOnce  sync.Once
+	actualDir       string
+	sftpClient      *pkgsftp.Client
+	sshClient       *ssh.Client
+	session         *ssh.Session
+	stdin           io.WriteCloser
+	done            chan error
+	closeOnce       sync.Once
+	cancelKeepalive context.CancelFunc
 }
 
 func (s *sftpCommandSession) ActualDir() string {
@@ -326,6 +334,9 @@ func (s *sftpCommandSession) Interrupt() error {
 func (s *sftpCommandSession) Close() error {
 	var err error
 	s.closeOnce.Do(func() {
+		if s.cancelKeepalive != nil {
+			s.cancelKeepalive()
+		}
 		_ = s.session.Signal(ssh.SIGHUP)
 		_ = s.stdin.Close()
 		if closeErr := s.session.Close(); closeErr != nil {
@@ -339,6 +350,39 @@ func (s *sftpCommandSession) Close() error {
 
 func (s *sftpCommandSession) Wait() error {
 	return <-s.done
+}
+
+func (s *sftpCommandSession) keepAlive(ctx context.Context) {
+	ticker := time.NewTicker(sftpCommandKeepaliveInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			requestCtx, cancel := context.WithTimeout(ctx, sftpCommandKeepaliveTimeout)
+			err := s.sendKeepalive(requestCtx)
+			cancel()
+			if err != nil {
+				_ = s.Close()
+				return
+			}
+		}
+	}
+}
+
+func (s *sftpCommandSession) sendKeepalive(ctx context.Context) error {
+	errCh := make(chan error, 1)
+	go func() {
+		_, _, err := s.sshClient.SendRequest("keepalive@openssh.com", true, nil)
+		errCh <- err
+	}()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-errCh:
+		return err
+	}
 }
 
 func (s *SFTP) sshObjectPath(ctx context.Context, client *pkgsftp.Client, key string) (string, error) {
@@ -424,12 +468,17 @@ func (s *SFTP) FileURL(key, _ string) string {
 	if prefix := strings.TrimSpace(s.cfg.URLPrefix); prefix != "" {
 		return strings.TrimRight(prefix, "/") + "/" + key
 	}
-	u := url.URL{
-		Scheme: "sftp",
-		Host:   net.JoinHostPort(strings.TrimSpace(s.cfg.Host), strconv.Itoa(s.cfg.PortOrDefault())),
-		Path:   "/" + objectPath,
+	return scpFilePath(strings.TrimSpace(s.cfg.Host), s.cfg.PortOrDefault(), "/"+objectPath)
+}
+
+func scpFilePath(host string, port int, remotePath string) string {
+	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
+		host = "[" + host + "]"
 	}
-	return u.String()
+	if port == 22 {
+		return host + ":" + remotePath
+	}
+	return host + ":" + strconv.Itoa(port) + ":" + remotePath
 }
 
 func (s *SFTP) List(ctx context.Context, _ string, dir string) ([]Object, error) {
@@ -586,7 +635,7 @@ func (s *SFTP) remoteOutput(ctx context.Context, client *ssh.Client, command str
 func (s *SFTP) authMethods() ([]ssh.AuthMethod, error) {
 	var auth []ssh.AuthMethod
 	if strings.TrimSpace(s.cfg.Password) != "" {
-		auth = append(auth, ssh.Password(s.cfg.Password))
+		auth = append(auth, passwordAuthMethods(s.cfg.Password)...)
 	}
 	privateKey := strings.TrimSpace(s.cfg.PrivateKey)
 	if privateKey != "" {
@@ -608,6 +657,19 @@ func (s *SFTP) authMethods() ([]ssh.AuthMethod, error) {
 		return nil, fmt.Errorf("sftp auth method is required")
 	}
 	return auth, nil
+}
+
+func passwordAuthMethods(password string) []ssh.AuthMethod {
+	return []ssh.AuthMethod{
+		ssh.Password(password),
+		ssh.KeyboardInteractive(func(_ string, _ string, questions []string, _ []bool) ([]string, error) {
+			answers := make([]string, len(questions))
+			for i := range answers {
+				answers[i] = password
+			}
+			return answers, nil
+		}),
+	}
 }
 
 func (s *SFTP) hostKeyCallback() ssh.HostKeyCallback {

@@ -177,7 +177,7 @@ SFTP 字段：
 | `passphrase` | 否 | 加密私钥的口令；私钥没有加密时留空 |
 | `hostKeyFingerprint` | 否 | 服务端主机公钥指纹，格式如 `SHA256:...`；管理界面不需要手工填写，首次测试会自动捕获并保存 |
 | `rootPath` | 否 | SFTP 远程根目录，支持相对路径或绝对路径 |
-| `urlPrefix` | 否 | 公开访问根 URL，表示 `rootPath` 对应的外部访问地址；为空时返回 `sftp://host:port/rootPath/object_path` |
+| `urlPrefix` | 否 | 公开访问根 URL，表示 `rootPath` 对应的外部访问地址；为空时返回 SCP 路径格式 `host:/rootPath/object_path`，非 22 端口返回 `host:port:/rootPath/object_path` |
 | `uploadPath` | 否 | 当前 SFTP 配置的上传目录模板 |
 | `name` | 否 | 配置名称；上传接口可通过 `/upload?name=xxx` 指定上传到该 SFTP 配置 |
 
@@ -491,3 +491,7 @@ go test ./...
 ./bin/build.sh linux-amd
 ./bin/build.sh all
 ```
+
+## 友情链接
+
+- [LINUX DO - 新的理想型社区](https://linux.do/)
