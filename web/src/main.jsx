@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { createRoot } from 'react-dom/client';
-import { ArchiveRestore, Check, ChevronDown, Code2, Eraser, FilePenLine, FolderOpen, Link2, LogOut, Maximize2, Minimize2, OctagonX, Save, Settings, SquarePen, Terminal, X } from 'lucide-react';
+import { ArchiveRestore, Check, ChevronDown, Code2, CornerDownLeft, Eraser, FilePenLine, FolderOpen, Keyboard, Link2, LogOut, Maximize2, Minimize2, OctagonX, Save, Settings, SquarePen, Terminal, X } from 'lucide-react';
 import MonacoEditor from '@monaco-editor/react';
 import 'highlight.js/styles/github.css';
 import 'katex/dist/katex.min.css';
@@ -77,6 +77,19 @@ const fieldLabels = {
   privateKey: '私钥内容',
   passphrase: '私钥口令',
 };
+
+const renamePlaceholderHelp = [
+  ['{filename}', '完整原文件名，例如 photo.png'],
+  ['{fname}', '不含扩展名的文件名，例如 photo'],
+  ['{ext}', '包含点号的扩展名，例如 .png'],
+  ['{extName}', '不含点号的扩展名，例如 png'],
+  ['{year}', '四位年份，例如 2026'],
+  ['{month}', '两位月份，例如 05'],
+  ['{day}', '两位日期，例如 29'],
+  ['{unix_ts}', 'Unix 时间戳'],
+  ['{fname_hash}', '基于原文件名生成的短哈希'],
+  ['{md5}', '文件 MD5 值'],
+];
 
 const MERMAID_PATTERN = /```mermaid[\s\S]*?```/i;
 const MATH_PATTERN = /\$\$[\s\S]+?\$\$|\$[^$\n]+?\$/;
@@ -974,7 +987,7 @@ function FilePanel({ config, selectedTarget, path, setPath, objects, busy, onRef
             {isSFTPTarget && (
               <button className="ghost" onClick={() => setCommandDialog(true)}>
                 <Terminal size={15} strokeWidth={2.2} />
-                执行
+                终端
               </button>
             )}
           </div>
@@ -1291,8 +1304,7 @@ function ConfigPanel({ configState, selectedTarget, setSelectedTarget, onSaved, 
     <section className="panel config-panel">
       <div className="panel-head">
         <div>
-          <p className="eyebrow">config</p>
-          <h2>配置管理</h2>
+          <p className="eyebrow">配置管理</p>
         </div>
       </div>
 
@@ -1306,7 +1318,7 @@ function ConfigPanel({ configState, selectedTarget, setSelectedTarget, onSaved, 
           </div>
           <div className="form-grid">
             <Field label={fieldLabel('key')} value={draft.key} onChange={(value) => update('key', value)} />
-            <Field label={fieldLabel('rename')} value={draft.rename} onChange={(value) => update('rename', value)} />
+            <Field label={fieldLabel('rename')} help={renamePlaceholderHelp} value={draft.rename} onChange={(value) => update('rename', value)} />
             <Field label={fieldLabel('host')} value={draft.host} onChange={(value) => update('host', value)} />
             <Field label={fieldLabel('port')} type="number" value={draft.port || ''} onChange={(value) => update('port', Number(value) || 0)} />
             <Field label={fieldLabel('basePath')} value={draft.basePath} onChange={(value) => update('basePath', value)} />
@@ -1643,6 +1655,7 @@ function ConfirmDialog({ title, message, confirmText = '确认', onCancel, onCon
 }
 
 const commandHistoryKey = 'upimg:sftp-command-history';
+let terminalOutputSequence = 0;
 
 function CommandDialog({ target, path, onClose, onError, onMessage }) {
   const [command, setCommand] = useState('');
@@ -1654,6 +1667,7 @@ function CommandDialog({ target, path, onClose, onError, onMessage }) {
   const [actualPath, setActualPath] = useState('');
   const [maximized, setMaximized] = useState(false);
   const socketRef = useRef(null);
+  const commandInputRef = useRef(null);
   const terminalRef = useRef(null);
   const connectedRef = useRef(false);
 
@@ -1732,12 +1746,16 @@ function CommandDialog({ target, path, onClose, onError, onMessage }) {
   }, [output]);
 
   function appendOutput(entry) {
-    setOutput((current) => [...current, { id: `${Date.now()}-${current.length}`, ...entry }]);
+    setOutput((current) => appendTerminalOutput(current, entry));
   }
 
-  function selectHistory(item) {
+  function selectHistory(event, item) {
+    event.preventDefault();
     setCommand(item);
     setHistoryOpen(false);
+    window.requestAnimationFrame(() => {
+      commandInputRef.current?.focus();
+    });
   }
 
   function removeHistory(item) {
@@ -1763,6 +1781,12 @@ function CommandDialog({ target, path, onClose, onError, onMessage }) {
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
     socket.send(JSON.stringify({ type: 'interrupt' }));
     setStatus('正在中断...');
+  }
+
+  function sendTerminalInput(input) {
+    const socket = socketRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    socket.send(JSON.stringify({ type: 'input', data: input }));
   }
 
   function closeDialog() {
@@ -1793,6 +1817,7 @@ function CommandDialog({ target, path, onClose, onError, onMessage }) {
           <label className="field command-field">
             <div className="command-input-wrap">
               <input
+                ref={commandInputRef}
                 autoFocus
                 value={command}
                 disabled={!connected}
@@ -1800,7 +1825,7 @@ function CommandDialog({ target, path, onClose, onError, onMessage }) {
                 onKeyDown={(event) => {
                   if (event.key === 'Escape') setHistoryOpen(false);
                 }}
-                placeholder="例如 cd app && docker compose up"
+                placeholder="输入命令并回车执行"
               />
               <button
                 className={historyOpen ? 'path-history-toggle active' : 'path-history-toggle'}
@@ -1816,6 +1841,12 @@ function CommandDialog({ target, path, onClose, onError, onMessage }) {
               <button className="path-history-toggle danger-icon" type="button" disabled={!connected} onClick={interruptCommand} aria-label="中断当前命令" title="中断当前命令">
                 <OctagonX size={15} strokeWidth={2.2} />
               </button>
+              <button className="path-history-toggle" type="button" disabled={!connected} onClick={() => sendTerminalInput('enter')} aria-label="发送回车" title="发送回车">
+                <CornerDownLeft size={15} strokeWidth={2.2} />
+              </button>
+              <button className="path-history-toggle" type="button" disabled={!connected} onClick={() => sendTerminalInput('escape')} aria-label="发送 ESC" title="发送 ESC">
+                <Keyboard size={15} strokeWidth={2.2} />
+              </button>
               {historyOpen && (
                 <div className="command-history-menu" role="listbox" aria-label="历史命令">
                   {history.length === 0 ? (
@@ -1823,7 +1854,7 @@ function CommandDialog({ target, path, onClose, onError, onMessage }) {
                   ) : (
                     history.map((item) => (
                       <div className="command-history-item" key={item}>
-                        <button className="command-history-select" type="button" role="option" onMouseDown={() => selectHistory(item)}>
+                        <button className="command-history-select" type="button" role="option" onMouseDown={(event) => selectHistory(event, item)}>
                           {item}
                         </button>
                         <button
@@ -1880,8 +1911,98 @@ function cleanTerminalOutput(value) {
     .replace(/\[\?2004[hl]/g, '')
     .replace(/\]0;[^\x07]*(?:\x07|$)/g, '')
     .replace(/\]1337;[^\x07]*(?:\x07|$)/g, '')
-    .replace(/\x07/g, '')
-    .replace(/\r(?!\n)/g, '\n');
+    .replace(/\x07/g, '');
+}
+
+function appendTerminalOutput(current, entry) {
+  const data = String(entry.data || '');
+  if (!data) return current;
+
+  let next = current.slice();
+  let replaceLine = hasPendingTerminalLineReplacement(next);
+  let buffer = '';
+
+  const flush = (text, replace) => {
+    if (!text) return;
+    if (replace) next = dropCurrentTerminalLine(next);
+    next = appendTerminalText(next, entry.type, text);
+    replaceLine = false;
+  };
+
+  for (let index = 0; index < data.length; index += 1) {
+    const char = data[index];
+    if (char === '\r') {
+      if (data[index + 1] === '\n') {
+        buffer += '\n';
+        flush(buffer, replaceLine && buffer !== '\n');
+        buffer = '';
+        index += 1;
+        continue;
+      }
+      flush(buffer, replaceLine);
+      buffer = '';
+      replaceLine = true;
+      continue;
+    }
+    if (char === '\n') {
+      buffer += '\n';
+      flush(buffer, replaceLine && buffer !== '\n');
+      buffer = '';
+      continue;
+    }
+    buffer += char;
+  }
+
+  flush(buffer, replaceLine);
+  return replaceLine ? markTerminalLineForReplacement(next) : clearTerminalLineReplacement(next);
+}
+
+function appendTerminalText(items, type, text) {
+  return splitTerminalText(text).reduce((current, part) => {
+    const last = current[current.length - 1];
+    const cleanLast = last?.replaceNext ? { ...last, replaceNext: false } : last;
+    const base = cleanLast && cleanLast !== last ? [...current.slice(0, -1), cleanLast] : current;
+
+    if (cleanLast && cleanLast.type === type && !cleanLast.data.endsWith('\n')) {
+      return [
+        ...base.slice(0, -1),
+        { ...cleanLast, data: cleanLast.data + part },
+      ];
+    }
+
+    return [
+      ...base,
+      { id: `terminal-${terminalOutputSequence += 1}`, type, data: part },
+    ];
+  }, items);
+}
+
+function splitTerminalText(text) {
+  return text.match(/[^\n]*\n|[^\n]+/g) || [];
+}
+
+function hasPendingTerminalLineReplacement(items) {
+  return Boolean(items[items.length - 1]?.replaceNext);
+}
+
+function clearTerminalLineReplacement(items) {
+  const last = items[items.length - 1];
+  if (!last?.replaceNext) return items;
+  return [...items.slice(0, -1), { ...last, replaceNext: false }];
+}
+
+function markTerminalLineForReplacement(items) {
+  const last = items[items.length - 1];
+  if (!last || last.data.endsWith('\n')) return items;
+  return [...items.slice(0, -1), { ...last, replaceNext: true }];
+}
+
+function dropCurrentTerminalLine(items) {
+  const next = clearTerminalLineReplacement(items).slice();
+  while (next.length > 0 && !next[next.length - 1].data.endsWith('\n')) {
+    next.pop();
+  }
+  return next;
 }
 
 function loadCommandHistory() {
@@ -2681,10 +2802,25 @@ function fieldLabel(field) {
   return fieldLabels[field] || field;
 }
 
-function Field({ label, value, onChange, type = 'text', multiline = false, wide = false }) {
+function Field({ label, value, onChange, type = 'text', multiline = false, wide = false, help = null }) {
   return (
     <label className={wide ? 'field wide' : 'field'}>
-      <span>{label}</span>
+      <span className="field-label">
+        <span>{label}</span>
+        {help && (
+          <span className="field-help" tabIndex={0} aria-label={`${label}占位符说明`}>
+            ?
+            <span className="field-help-popover" role="tooltip">
+              {help.map(([token, description]) => (
+                <span className="field-help-row" key={token}>
+                  <code>{token}</code>
+                  <span>{description}</span>
+                </span>
+              ))}
+            </span>
+          </span>
+        )}
+      </span>
       {multiline ? (
         <textarea value={value ?? ''} onChange={(event) => onChange(event.target.value)} />
       ) : (

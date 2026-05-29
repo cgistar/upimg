@@ -322,6 +322,14 @@ func (s *sftpCommandSession) WriteCommand(command string) error {
 	return err
 }
 
+func (s *sftpCommandSession) WriteInput(input string) error {
+	if input == "" {
+		return fmt.Errorf("input is required")
+	}
+	_, err := io.WriteString(s.stdin, input)
+	return err
+}
+
 func (s *sftpCommandSession) Interrupt() error {
 	_, writeErr := s.stdin.Write([]byte{3})
 	signalErr := s.session.Signal(ssh.SIGINT)

@@ -53,6 +53,7 @@ type ArchiveExtractor interface {
 type CommandSession interface {
 	ActualDir() string
 	WriteCommand(command string) error
+	WriteInput(input string) error
 	Interrupt() error
 	Close() error
 	Wait() error

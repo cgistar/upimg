@@ -1221,6 +1221,15 @@ func (a *App) handleAdminSFTPTerminal(w http.ResponseWriter, r *http.Request) {
 				if err := commandSession.Interrupt(); err != nil {
 					_ = sender.send(adminTerminalServerMessage{Type: "error", Message: err.Error()})
 				}
+			case "input":
+				input, err := adminTerminalInput(msg.Data)
+				if err != nil {
+					_ = sender.send(adminTerminalServerMessage{Type: "error", Message: err.Error()})
+					continue
+				}
+				if err := commandSession.WriteInput(input); err != nil {
+					_ = sender.send(adminTerminalServerMessage{Type: "error", Message: err.Error()})
+				}
 			case "close":
 				readErr <- nil
 				return
@@ -1242,6 +1251,17 @@ func (a *App) handleAdminSFTPTerminal(w http.ResponseWriter, r *http.Request) {
 		_ = commandSession.Close()
 	}
 	_ = conn.Close(websocket.StatusNormalClosure, "")
+}
+
+func adminTerminalInput(key string) (string, error) {
+	switch key {
+	case "enter":
+		return "\r", nil
+	case "escape":
+		return "\x1b", nil
+	default:
+		return "", fmt.Errorf("unsupported terminal input: %s", key)
+	}
 }
 
 func keepAdminTerminalWebSocketAlive(ctx context.Context, cancel context.CancelFunc, conn *websocket.Conn) {
