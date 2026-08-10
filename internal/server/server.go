@@ -48,9 +48,16 @@ type App struct {
 }
 
 type UploadResult struct {
-	FileName string `json:"fileName"`
-	ImgURL   string `json:"imgUrl"`
-	Type     string `json:"type"`
+	FileName  string `json:"fileName"`
+	ImgURL    string `json:"imgUrl"`
+	Type      string `json:"type"`
+	ObjectKey string `json:"objectKey"`
+}
+
+type CapabilitiesResponse struct {
+	Success    bool     `json:"success"`
+	APIVersion int      `json:"apiVersion"`
+	Features   []string `json:"features"`
 }
 
 type UploadResponse struct {
@@ -113,11 +120,25 @@ func (a *App) Handler() http.Handler {
 	mux.Handle("/admin/", adminHandler)
 	mux.HandleFunc("/api/admin/", a.handleAdminAPI)
 	mux.HandleFunc("/office-preview/", a.handleOfficePreviewFile)
+	mux.HandleFunc("/capabilities", a.handleCapabilities)
 	mux.HandleFunc("/upload", a.handleUpload)
 	mux.HandleFunc("/delete/", a.handleDelete)
 	mux.HandleFunc("/files/", a.handleFiles)
 	mux.HandleFunc("/list", a.handleList)
 	return withCORS(a.withBasePath(mux))
+}
+
+func (a *App) handleCapabilities(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(CapabilitiesResponse{
+		Success:    true,
+		APIVersion: 2,
+		Features:   []string{"upload-object-key", "delete-by-name"},
+	})
 }
 
 func (a *App) setRuntime(runtime config.Runtime, backend storage.Backend) {
@@ -234,7 +255,12 @@ func (a *App) handleDelete(w http.ResponseWriter, r *http.Request) {
 		writeUploadStatus(w, http.StatusNotFound, UploadResponse{Success: false, Message: err.Error()})
 		return
 	}
-	if err := a.backend.Delete(r.Context(), key); err != nil {
+	backend, err := a.uploadBackend(r)
+	if err != nil {
+		writeUploadStatus(w, http.StatusBadRequest, UploadResponse{Success: false, Message: err.Error()})
+		return
+	}
+	if err := backend.Delete(r.Context(), key); err != nil {
 		writeUploadStatus(w, http.StatusNotFound, UploadResponse{Success: false, Message: "file not found"})
 		return
 	}
@@ -404,7 +430,7 @@ func (a *App) uploadResult(backend storage.Backend, key, baseURL string, stored 
 			stored.URL = backend.FileURL(key, localBaseURL)
 		}
 	}
-	return UploadResult{FileName: stored.FileName, ImgURL: stored.URL, Type: stored.Type}
+	return UploadResult{FileName: stored.FileName, ImgURL: stored.URL, Type: stored.Type, ObjectKey: key}
 }
 
 func (a *App) uploadDir(backend storage.Backend) string {

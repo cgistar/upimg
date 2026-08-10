@@ -945,7 +945,13 @@ func (a *App) handleAdminStorageDownload(w http.ResponseWriter, r *http.Request)
 	}
 	w.Header().Set("Content-Disposition", "attachment; filename="+strconv.Quote(fileName))
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.WriteHeader(http.StatusOK)
+	if seeker, ok := reader.(io.ReadSeeker); ok {
+		http.ServeContent(w, r, fileName, time.Time{}, seeker)
+		return
+	}
+	if sized, ok := reader.(storage.SizedReadCloser); ok && sized.Size() >= 0 {
+		w.Header().Set("Content-Length", strconv.FormatInt(sized.Size(), 10))
+	}
 	_, _ = io.Copy(w, reader)
 }
 

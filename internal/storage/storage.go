@@ -34,6 +34,22 @@ type Backend interface {
 	List(ctx context.Context, baseURL, dir string) ([]Object, error)
 }
 
+// SizedReadCloser 在保持流式读取的同时暴露对象的可信长度。
+// Size 返回负数表示上游没有提供长度。
+type SizedReadCloser interface {
+	io.ReadCloser
+	Size() int64
+}
+
+type sizedReadCloser struct {
+	io.ReadCloser
+	size int64
+}
+
+func (r *sizedReadCloser) Size() int64 {
+	return r.size
+}
+
 type DirectoryCreator interface {
 	CreateDir(ctx context.Context, key string) error
 }
@@ -109,4 +125,75 @@ func sortObjects(objects []Object) {
 		}
 		return objects[i].Path < objects[j].Path
 	})
+}
+
+// encodeURLPath escapes each path segment for use in an HTTP URL path,
+// while preserving "/" separators. Empty input returns "".
+//
+// Encoding is stricter than url.PathEscape: only RFC 3986 unreserved
+// characters (ALPHA / DIGIT / "-" / "." / "_" / "~") stay raw. This
+// avoids reverse-proxy pitfalls such as treating "+" as a space.
+func encodeURLPath(key string) string {
+	key = strings.TrimLeft(strings.ReplaceAll(key, "\\", "/"), "/")
+	if key == "" {
+		return ""
+	}
+	parts := strings.Split(key, "/")
+	for i, part := range parts {
+		parts[i] = escapePathSegment(part)
+	}
+	return strings.Join(parts, "/")
+}
+
+func escapePathSegment(s string) string {
+	if s == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(len(s) + 8)
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if isURLUnreserved(c) {
+			b.WriteByte(c)
+			continue
+		}
+		// Percent-encode one byte at a time (UTF-8 multibyte chars are encoded per byte).
+		b.WriteByte('%')
+		b.WriteByte(upperHex(c >> 4))
+		b.WriteByte(upperHex(c & 0xf))
+	}
+	return b.String()
+}
+
+func isURLUnreserved(c byte) bool {
+	switch {
+	case c >= 'a' && c <= 'z':
+		return true
+	case c >= 'A' && c <= 'Z':
+		return true
+	case c >= '0' && c <= '9':
+		return true
+	case c == '-' || c == '.' || c == '_' || c == '~':
+		return true
+	default:
+		return false
+	}
+}
+
+func upperHex(v byte) byte {
+	const hex = "0123456789ABCDEF"
+	return hex[v]
+}
+
+// joinObjectURL joins a base URL prefix with an object key, escaping the key path.
+func joinObjectURL(prefix, key string) string {
+	prefix = strings.TrimRight(prefix, "/")
+	escaped := encodeURLPath(key)
+	if escaped == "" {
+		return prefix
+	}
+	if prefix == "" {
+		return escaped
+	}
+	return prefix + "/" + escaped
 }

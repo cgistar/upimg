@@ -223,7 +223,7 @@ func (w *WebDAV) OpenReader(ctx context.Context, key string) (io.ReadCloser, err
 		_ = resp.Body.Close()
 		return nil, fmt.Errorf("webdav get failed: %s", resp.Status)
 	}
-	return resp.Body, nil
+	return &sizedReadCloser{ReadCloser: resp.Body, size: resp.ContentLength}, nil
 }
 
 func (w *WebDAV) FileURL(key, _ string) string {
@@ -233,7 +233,7 @@ func (w *WebDAV) FileURL(key, _ string) string {
 		objectPath = path.Join(w.rootPath, key)
 	}
 	if prefix := strings.TrimSpace(w.cfg.URLPrefix); prefix != "" {
-		return strings.TrimRight(prefix, "/") + "/" + objectPath
+		return joinObjectURL(prefix, objectPath)
 	}
 	return w.remoteURL(objectPath, false)
 }

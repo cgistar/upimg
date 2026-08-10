@@ -474,7 +474,7 @@ func (s *SFTP) FileURL(key, _ string) string {
 		objectPath = strings.TrimLeft(path.Join(s.rootPath, key), "/")
 	}
 	if prefix := strings.TrimSpace(s.cfg.URLPrefix); prefix != "" {
-		return strings.TrimRight(prefix, "/") + "/" + key
+		return joinObjectURL(prefix, key)
 	}
 	return scpFilePath(strings.TrimSpace(s.cfg.Host), s.cfg.PortOrDefault(), "/"+objectPath)
 }

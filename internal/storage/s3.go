@@ -209,18 +209,22 @@ func (s *S3) OpenReader(ctx context.Context, key string) (io.ReadCloser, error) 
 	if err != nil {
 		return nil, err
 	}
-	return output.Body, nil
+	size := int64(-1)
+	if output.ContentLength != nil {
+		size = *output.ContentLength
+	}
+	return &sizedReadCloser{ReadCloser: output.Body, size: size}, nil
 }
 
 func (s *S3) FileURL(key, _ string) string {
 	key = strings.TrimLeft(strings.ReplaceAll(key, "\\", "/"), "/")
 	if prefix := strings.TrimSpace(s.cfg.URLPrefix); prefix != "" {
-		return strings.TrimRight(prefix, "/") + "/" + key
+		return joinObjectURL(prefix, key)
 	}
 	if endpoint := strings.TrimSpace(s.cfg.Endpoint); endpoint != "" {
-		return strings.TrimRight(endpoint, "/") + "/" + s.cfg.Bucket + "/" + key
+		return joinObjectURL(strings.TrimRight(endpoint, "/")+"/"+s.cfg.Bucket, key)
 	}
-	return fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", s.cfg.Bucket, s.cfg.Region, key)
+	return joinObjectURL(fmt.Sprintf("https://%s.s3.%s.amazonaws.com", s.cfg.Bucket, s.cfg.Region), key)
 }
 
 func (s *S3) List(ctx context.Context, _ string, dir string) ([]Object, error) {

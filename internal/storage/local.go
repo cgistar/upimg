@@ -173,7 +173,7 @@ func (l *Local) FileURL(key, baseURL string) string {
 	if baseURL == "" {
 		return filepath.Join(l.root, filepath.FromSlash(key))
 	}
-	return strings.TrimRight(baseURL, "/") + "/" + key
+	return joinObjectURL(baseURL, key)
 }
 
 func (l *Local) List(ctx context.Context, baseURL, dir string) ([]Object, error) {
