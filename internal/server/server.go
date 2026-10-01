@@ -22,8 +22,6 @@ import (
 	"upimg/internal/webui"
 )
 
-const maxUploadSize = 1024 * 1024 * 1024
-
 type App struct {
 	mu            sync.RWMutex
 	runtime       config.Runtime
@@ -207,7 +205,6 @@ func (a *App) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
 	backend, err := a.uploadBackend(r)
 	if err != nil {
 		writeUpload(w, UploadResponse{Success: false, Message: err.Error()})
