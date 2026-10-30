@@ -108,7 +108,7 @@ func (l *Local) Rename(ctx context.Context, sourceKey, destinationKey string) er
 	}
 	if destinationInfo, err := os.Stat(destination); err == nil {
 		if !os.SameFile(info, destinationInfo) {
-			return fmt.Errorf("destination already exists")
+			return ErrDestinationExists
 		}
 		temp := filepath.Join(filepath.Dir(source), fmt.Sprintf(".%s.%d.rename", filepath.Base(source), time.Now().UnixNano()))
 		if err := ctx.Err(); err != nil {
@@ -126,6 +126,9 @@ func (l *Local) Rename(ctx context.Context, sourceKey, destinationKey string) er
 		return err
 	}
 	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
 		return err
 	}
 	return os.Rename(source, destination)
@@ -223,6 +226,24 @@ func (l *Local) List(ctx context.Context, baseURL, dir string) ([]Object, error)
 	}
 	sortObjects(objects)
 	return objects, nil
+}
+
+func (l *Local) Exists(ctx context.Context, key string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	target, err := l.safePath(key)
+	if err != nil {
+		return false, err
+	}
+	info, err := os.Stat(target)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return !info.IsDir(), nil
 }
 
 func (l *Local) Open(key string) (*os.File, error) {

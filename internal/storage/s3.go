@@ -109,7 +109,7 @@ func (s *S3) Rename(ctx context.Context, sourceKey, destinationKey string) error
 		Bucket: aws.String(s.cfg.Bucket),
 		Key:    aws.String(destinationKey),
 	}); err == nil {
-		return fmt.Errorf("destination already exists")
+		return ErrDestinationExists
 	} else if !isS3NotFound(err) {
 		return err
 	}
@@ -182,6 +182,18 @@ func (s *S3) copySource(key string) string {
 	escapedBucket := url.PathEscape(s.cfg.Bucket)
 	escapedKey := strings.ReplaceAll(url.PathEscape(key), "%2F", "/")
 	return escapedBucket + "/" + escapedKey
+}
+
+func (s *S3) Exists(ctx context.Context, key string) (bool, error) {
+	key, err := naming.SafeRelative(key)
+	if err != nil {
+		return false, err
+	}
+	_, err = s.client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(s.cfg.Bucket), Key: aws.String(key)})
+	if isS3NotFound(err) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 func isS3NotFound(err error) bool {

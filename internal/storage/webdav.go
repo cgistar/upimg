@@ -136,6 +136,11 @@ func (w *WebDAV) Rename(ctx context.Context, sourceKey, destinationKey string) e
 	if isDir {
 		return fmt.Errorf("target is not a file")
 	}
+	if path.Dir(sourceKey) != path.Dir(destinationKey) {
+		if err := w.ensureParentCollections(ctx, destinationKey); err != nil {
+			return err
+		}
+	}
 	req, err := w.newRequest(ctx, "MOVE", w.remoteObjectPath(sourceKey), false, nil)
 	if err != nil {
 		return err
@@ -148,7 +153,7 @@ func (w *WebDAV) Rename(ctx context.Context, sourceKey, destinationKey string) e
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusPreconditionFailed {
-		return fmt.Errorf("destination already exists")
+		return ErrDestinationExists
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("webdav move failed: %s", resp.Status)
@@ -236,6 +241,37 @@ func (w *WebDAV) FileURL(key, _ string) string {
 		return joinObjectURL(prefix, objectPath)
 	}
 	return w.remoteURL(objectPath, false)
+}
+
+func (w *WebDAV) Exists(ctx context.Context, key string) (bool, error) {
+	key, err := naming.SafeRelative(key)
+	if err != nil {
+		return false, err
+	}
+	req, err := w.newRequest(ctx, "PROPFIND", w.remoteObjectPath(key), false, nil)
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("Depth", "0")
+	resp, err := w.client.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return false, nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return false, fmt.Errorf("webdav propfind failed: %s", resp.Status)
+	}
+	var multi davMultiStatus
+	if err := xml.NewDecoder(resp.Body).Decode(&multi); err != nil {
+		return false, err
+	}
+	for _, response := range multi.Responses {
+		return !response.successProp().ResourceType.Collection, nil
+	}
+	return false, nil
 }
 
 func (w *WebDAV) isCollection(ctx context.Context, key string) (bool, error) {

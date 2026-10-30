@@ -153,12 +153,17 @@ func (s *SFTP) Rename(ctx context.Context, sourceKey, destinationKey string) err
 			return fmt.Errorf("target is not a file")
 		}
 		if _, err := client.Stat(destinationPath); err == nil {
-			return fmt.Errorf("destination already exists")
+			return ErrDestinationExists
 		} else if !os.IsNotExist(err) {
 			return err
 		}
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if parent := path.Dir(destinationPath); parent != path.Dir(sourcePath) && parent != "." && parent != "/" {
+			if err := client.MkdirAll(parent); err != nil {
+				return err
+			}
 		}
 		return client.Rename(sourcePath, destinationPath)
 	})
@@ -557,6 +562,26 @@ func (s *SFTP) deleteDir(ctx context.Context, client *pkgsftp.Client, remotePath
 		}
 	}
 	return client.RemoveDirectory(remotePath)
+}
+
+func (s *SFTP) Exists(ctx context.Context, key string) (bool, error) {
+	key, err := naming.SafeRelative(key)
+	if err != nil {
+		return false, err
+	}
+	exists := false
+	err = s.withClient(ctx, func(client *pkgsftp.Client) error {
+		info, err := client.Stat(s.remoteObjectPath(key))
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		exists = !info.IsDir()
+		return nil
+	})
+	return exists, err
 }
 
 func (s *SFTP) withClient(ctx context.Context, fn func(*pkgsftp.Client) error) error {

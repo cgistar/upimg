@@ -5,6 +5,7 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -65,6 +66,22 @@ type UploadResponse struct {
 	Message    string         `json:"message,omitempty"`
 }
 
+type MoveRequest struct {
+	Source      string `json:"source"`
+	Destination string `json:"destination"`
+}
+
+// MoveResponse 的 Partial 表示目标已写入但源对象删除失败；AlreadyMoved 表示源已不存在而目标存在，
+// 视为此前已完成的同一移动（调用方应自行核对内容）。两种情况目标地址均有效。
+type MoveResponse struct {
+	Success      bool   `json:"success"`
+	Partial      bool   `json:"partial,omitempty"`
+	AlreadyMoved bool   `json:"alreadyMoved,omitempty"`
+	ObjectKey    string `json:"objectKey,omitempty"`
+	ImgURL       string `json:"imgUrl,omitempty"`
+	Message      string `json:"message,omitempty"`
+}
+
 type ListResponse struct {
 	Success bool             `json:"success"`
 	Result  []storage.Object `json:"result,omitempty"`
@@ -121,6 +138,7 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("/capabilities", a.handleCapabilities)
 	mux.HandleFunc("/upload", a.handleUpload)
 	mux.HandleFunc("/delete/", a.handleDelete)
+	mux.HandleFunc("/move", a.handleMove)
 	mux.HandleFunc("/files/", a.handleFiles)
 	mux.HandleFunc("/list", a.handleList)
 	return withCORS(a.withBasePath(mux))
@@ -135,7 +153,7 @@ func (a *App) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(CapabilitiesResponse{
 		Success:    true,
 		APIVersion: 2,
-		Features:   []string{"upload-object-key", "delete-by-name"},
+		Features:   []string{"upload-object-key", "delete-by-name", "move-by-name"},
 	})
 }
 
@@ -262,6 +280,79 @@ func (a *App) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeUpload(w, UploadResponse{Success: true, Message: "deleted"})
+}
+
+// handleMove 把单个文件移动到任意目录；目标已存在时拒绝，不覆盖。
+func (a *App) handleMove(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.NotFound(w, r)
+		return
+	}
+	if !a.verifyKey(r) {
+		writeMoveStatus(w, http.StatusUnauthorized, MoveResponse{Success: false, Message: "server key is uncorrect"})
+		return
+	}
+	var payload MoveRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&payload); err != nil {
+		writeMoveStatus(w, http.StatusBadRequest, MoveResponse{Success: false, Message: "invalid json"})
+		return
+	}
+	sourceKey, err := naming.SafeRelative(payload.Source)
+	if err != nil {
+		writeMoveStatus(w, http.StatusBadRequest, MoveResponse{Success: false, Message: "invalid source: " + err.Error()})
+		return
+	}
+	destinationKey, err := naming.SafeRelative(payload.Destination)
+	if err != nil {
+		writeMoveStatus(w, http.StatusBadRequest, MoveResponse{Success: false, Message: "invalid destination: " + err.Error()})
+		return
+	}
+	if sourceKey == destinationKey {
+		writeMoveStatus(w, http.StatusBadRequest, MoveResponse{Success: false, Message: "source and destination are the same"})
+		return
+	}
+	backend, err := a.uploadBackend(r)
+	if err != nil {
+		writeMoveStatus(w, http.StatusBadRequest, MoveResponse{Success: false, Message: err.Error()})
+		return
+	}
+	renamer, ok := backend.(storage.FileRenamer)
+	if !ok {
+		writeMoveStatus(w, http.StatusNotImplemented, MoveResponse{Success: false, Message: "file move is not supported"})
+		return
+	}
+	destinationURL := backend.FileURL(destinationKey, a.localBaseURL(baseURL(r)))
+	if err := renamer.Rename(r.Context(), sourceKey, destinationKey); err != nil {
+		var partial *storage.PartialRenameError
+		if !errors.As(err, &partial) && a.moveCompleted(r.Context(), backend, sourceKey, destinationKey) {
+			writeMove(w, MoveResponse{Success: true, AlreadyMoved: true, ObjectKey: destinationKey, ImgURL: destinationURL, Message: "already moved"})
+			return
+		}
+		switch {
+		case errors.As(err, &partial):
+			writeMove(w, MoveResponse{Success: true, Partial: true, ObjectKey: destinationKey, ImgURL: destinationURL, Message: partial.Error()})
+		case errors.Is(err, storage.ErrDestinationExists):
+			writeMoveStatus(w, http.StatusConflict, MoveResponse{Success: false, Message: err.Error()})
+		default:
+			writeMoveStatus(w, http.StatusBadRequest, MoveResponse{Success: false, Message: err.Error()})
+		}
+		return
+	}
+	writeMove(w, MoveResponse{Success: true, ObjectKey: destinationKey, ImgURL: destinationURL, Message: "moved"})
+}
+
+// moveCompleted 在移动失败后判断是否为已完成移动的重试：源不存在且目标存在。
+func (a *App) moveCompleted(ctx context.Context, backend storage.Backend, sourceKey, destinationKey string) bool {
+	stater, ok := backend.(storage.ObjectStater)
+	if !ok {
+		return false
+	}
+	sourceExists, err := stater.Exists(ctx, sourceKey)
+	if err != nil || sourceExists {
+		return false
+	}
+	destinationExists, err := stater.Exists(ctx, destinationKey)
+	return err == nil && destinationExists
 }
 
 func (a *App) handleFiles(w http.ResponseWriter, r *http.Request) {
@@ -672,6 +763,16 @@ func writeUpload(w http.ResponseWriter, response UploadResponse) {
 }
 
 func writeUploadStatus(w http.ResponseWriter, status int, response UploadResponse) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(response)
+}
+
+func writeMove(w http.ResponseWriter, response MoveResponse) {
+	writeMoveStatus(w, http.StatusOK, response)
+}
+
+func writeMoveStatus(w http.ResponseWriter, status int, response MoveResponse) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(response)

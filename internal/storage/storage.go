@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -58,6 +59,15 @@ type DirectoryDeleter interface {
 	DeleteDir(ctx context.Context, key string) error
 }
 
+// ErrDestinationExists 表示移动目标已存在；文件移动从不覆盖已有对象。
+var ErrDestinationExists = errors.New("destination already exists")
+
+// ObjectStater 判断文件对象是否存在；目录不算对象。移动接口借此识别已完成的重复请求。
+type ObjectStater interface {
+	Exists(ctx context.Context, key string) (bool, error)
+}
+
+// FileRenamer 移动单个文件，目标键可位于其他目录，缺失的父目录由后端补齐。
 type FileRenamer interface {
 	Rename(ctx context.Context, sourceKey, destinationKey string) error
 }
